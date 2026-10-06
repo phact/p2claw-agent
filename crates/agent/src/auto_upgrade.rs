@@ -28,7 +28,7 @@
 //! `P2CLAW_RELEASE_REPO=<org>/<repo>` env var → agent points at
 //! `https://github.com/<org>/<repo>/releases/latest`. Forkers
 //! don't need our repo or any custom infra. Default is
-//! `phact/p2claw-skill`.
+//! `phact/p2claw-agent`.
 //!
 //! ## Update-check policy
 //!
@@ -57,7 +57,12 @@ use tracing::{debug, warn};
 /// Default GH `<org>/<repo>` to fetch releases from. Operators
 /// running a fork point at their own via the
 /// `P2CLAW_RELEASE_REPO` env var.
-pub const DEFAULT_RELEASE_REPO: &str = "phact/p2claw-skill";
+pub const DEFAULT_RELEASE_REPO: &str = "phact/p2claw-agent";
+
+/// Where releases were published before they moved to
+/// [`DEFAULT_RELEASE_REPO`]. Service units installed with it set
+/// explicitly are redirected, since it no longer gets new releases.
+const PREVIOUS_RELEASE_REPO: &str = "phact/p2claw-skill";
 
 /// Env-var name for the OSS-fork override.
 pub const RELEASE_REPO_ENV: &str = "P2CLAW_RELEASE_REPO";
@@ -82,7 +87,7 @@ pub fn resolve_release_repo() -> String {
     match std::env::var(RELEASE_REPO_ENV) {
         Ok(v) => {
             let trimmed = v.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && trimmed != PREVIOUS_RELEASE_REPO {
                 return trimmed.to_string();
             }
             DEFAULT_RELEASE_REPO.to_string()
@@ -1479,6 +1484,18 @@ mod tests {
         assert_eq!(resolve_release_repo(), DEFAULT_RELEASE_REPO);
         if let Some(v) = prev {
             std::env::set_var(RELEASE_REPO_ENV, v);
+        }
+    }
+
+    #[test]
+    fn resolve_release_repo_redirects_previous_repo() {
+        let _g = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var(RELEASE_REPO_ENV).ok();
+        std::env::set_var(RELEASE_REPO_ENV, PREVIOUS_RELEASE_REPO);
+        assert_eq!(resolve_release_repo(), DEFAULT_RELEASE_REPO);
+        match prev {
+            Some(v) => std::env::set_var(RELEASE_REPO_ENV, v),
+            None => std::env::remove_var(RELEASE_REPO_ENV),
         }
     }
 

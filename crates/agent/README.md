@@ -185,7 +185,7 @@ two, matching CLI flags).
 | `P2CLAW_AGENT_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/p2claw`, else `/run/p2claw` as root | Holds `agent.sock`, the local-API Unix socket. |
 | `P2CLAW_AGENT_DISABLE_MAGICDNS` | unset | `true` skips the MagicDNS pipeline (local CA, 443 SNI listener, local DNS resolver, privilege drop). User-scope service installs set this; inbound traffic still works. |
 | `P2CLAW_DNS_PORT` | `5354` | Port for the local MagicDNS resolver when the pipeline is enabled. |
-| `P2CLAW_RELEASE_REPO` | `phact/p2claw-skill` | GitHub `<owner>/<repo>` auto-upgrade pulls releases from. See below. |
+| `P2CLAW_RELEASE_REPO` | `phact/p2claw-agent` | GitHub `<owner>/<repo>` auto-upgrade pulls releases from. See below. |
 
 The **parent domain** (`p2claw.com` for the public service) is the suffix
 under which app URLs are formed. It is assigned by the coordination server at
@@ -204,14 +204,14 @@ Self-hosters running their own coordination server set this together with
 
 Auto-upgrade is **on by default**. Once an hour the running agent resolves the
 latest release of the GitHub repository named by `P2CLAW_RELEASE_REPO`
-(default `phact/p2claw-skill`), downloads the tarball for its platform,
+(default `phact/p2claw-agent`), downloads the tarball for its platform,
 verifies the SHA-256 against the release's `SHA256SUMS` file, swaps the binary
 into place, and asks its service supervisor to restart it. The previous binary
 is kept as `<path>.previous` and restored if the new one fails its post-upgrade
 health check.
 
 **If you build the agent yourself or run a fork, a stock binary will replace
-itself with the official release from `phact/p2claw-skill` within an hour.**
+itself with the official release from `phact/p2claw-agent` within an hour.**
 To prevent that, do one of the following:
 
 - Point it at your own releases: set `P2CLAW_RELEASE_REPO=<owner>/<repo>` in

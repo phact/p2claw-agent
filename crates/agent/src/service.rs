@@ -1014,7 +1014,7 @@ mod tests {
 
     #[test]
     fn repo_slug_validation() {
-        assert!(is_valid_repo_slug("phact/p2claw-skill"));
+        assert!(is_valid_repo_slug("phact/p2claw-agent"));
         assert!(is_valid_repo_slug("acme.io/fork_1"));
         for bad in [
             "", "noslash", "/repo", "owner/", "a/b/c", "a b/c", "a/<x>", "a/b\nX=1",
