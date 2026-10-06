@@ -1,0 +1,19 @@
+[package]
+name = "p2claw-control-proto"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Used only by `FramingError` — same `thiserror` version every other
+# workspace crate already depends on, so this adds no new transitive
+# graph.
+thiserror = "2"
+
+[dev-dependencies]

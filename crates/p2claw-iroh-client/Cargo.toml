@@ -1,0 +1,36 @@
+[package]
+name = "p2claw-iroh-client"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[lints]
+workspace = true
+
+[lib]
+name = "p2claw_iroh_client"
+path = "src/lib.rs"
+
+[dependencies]
+p2claw-wire = { path = "../wire" }
+p2claw-identity = { path = "../identity" }
+p2claw-translator = { path = "../translator" }
+
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+iroh = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+# `url_parser.rs` is the only integration test in this crate; it
+# depends only on the lib surface. The cycle-inducing dev-deps
+# (p2claw-coordination, p2claw-agent, axum, etc.) moved with
+# `e2e_smoke.rs` to `crates/agent/tests/`.

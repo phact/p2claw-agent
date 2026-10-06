@@ -1,0 +1,81 @@
+{
+  "cases": [
+    {
+      "description": "Valid token issued by trusted peer_id with full OAuth identity claims (daemon mint)",
+      "expect": "ok",
+      "expected_claims": {
+        "auth_method": "oauth",
+        "email": "alice@example.com",
+        "exp": 1700000060,
+        "iat": 1700000000,
+        "iss": "xg4icmwxh3kx1odasrjqtkcmw6eb9bj4h4k57i9yhqeozmer131y",
+        "name": "Alice Q.",
+        "sub": "alice@example.com"
+      },
+      "name": "positive_oauth_identity",
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ4ZzRpY213eGgza3gxb2Rhc3JqcXRrY213NmViOWJqNGg0azU3aTl5aHFlb3ptZXIxMzF5Iiwic3ViIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDA2MCwiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSIsIm5hbWUiOiJBbGljZSBRLiIsImF1dGhfbWV0aG9kIjoib2F1dGgifQ.LVToooxff0oehRJ1DrwX7C33lN-hnrbsY6dP_BCV2sq1oJ6niOV6iE7AHXLZ7hI_IUKplEMiDceK5XIc4VHWAg",
+      "verify_at": 1700000030
+    },
+    {
+      "description": "Same valid token, but verify_at is past exp + leeway",
+      "expect": "err:Expired",
+      "name": "negative_expired",
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ4ZzRpY213eGgza3gxb2Rhc3JqcXRrY213NmViOWJqNGg0azU3aTl5aHFlb3ptZXIxMzF5Iiwic3ViIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDA2MCwiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSIsIm5hbWUiOiJBbGljZSBRLiIsImF1dGhfbWV0aG9kIjoib2F1dGgifQ.LVToooxff0oehRJ1DrwX7C33lN-hnrbsY6dP_BCV2sq1oJ6niOV6iE7AHXLZ7hI_IUKplEMiDceK5XIc4VHWAg",
+      "verify_at": 1700000090
+    },
+    {
+      "description": "Forged token with alg=none header — must reject without verifying",
+      "expect": "err:AlgorithmRejected",
+      "name": "negative_alg_none",
+      "token": "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJpc3MiOiJ4ZzRpY213eGgza3gxb2Rhc3JqcXRrY213NmViOWJqNGg0azU3aTl5aHFlb3ptZXIxMzF5Iiwic3ViIjoiYXR0YWNrZXIiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDA2MH0.",
+      "verify_at": 1700000030
+    },
+    {
+      "description": "Alg-substitution attempt with alg=HS256 — must reject (pinned to EdDSA)",
+      "expect": "err:AlgorithmRejected",
+      "name": "negative_alg_hs256",
+      "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ4ZzRpY213eGgza3gxb2Rhc3JqcXRrY213NmViOWJqNGg0azU3aTl5aHFlb3ptZXIxMzF5Iiwic3ViIjoiYXR0YWNrZXIiLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDA2MH0.AAAAAAAAAAAAAAAAAAAAAAAA",
+      "verify_at": 1700000030
+    },
+    {
+      "description": "Daemon mint by signer B (iss=B); verified against signer A's peer_id ⇒ signature path rejection",
+      "expect": "err:BadSignature",
+      "name": "negative_wrong_key",
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJicGRhcnh1dGJmcTdtZzk4dG1iOGR0bXM3aGhqOWI3c2VpbzRzYjZ4dWo4bTN3YnByYnlvIiwic3ViIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDA2MCwiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSIsIm5hbWUiOiJBbGljZSBRLiIsImF1dGhfbWV0aG9kIjoib2F1dGgifQ.VT_O1Z2dS_n6A1tv34BgkZE1YJhet2zAFl5fGS8sjfKXfztTk1B3tPTbhSBHweQknH2LF5yKQHIfPl_yudXsCg",
+      "verify_at": 1700000030
+    },
+    {
+      "description": "Positive token with claims segment swapped — signature no longer matches",
+      "expect": "err:BadSignature",
+      "name": "negative_tampered",
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ4ZzRpY213eGgza3gxb2Rhc3JqcXRrY213NmViOWJqNGg0azU3aTl5aHFlb3ptZXIxMzF5Iiwic3ViIjoiYWRtaW5AZXhhbXBsZS5jb20iLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDA2MCwiZW1haWwiOiJhZG1pbkBleGFtcGxlLmNvbSIsIm5hbWUiOiJBbGljZSBRLiIsImF1dGhfbWV0aG9kIjoib2F1dGgifQ.LVToooxff0oehRJ1DrwX7C33lN-hnrbsY6dP_BCV2sq1oJ6niOV6iE7AHXLZ7hI_IUKplEMiDceK5XIc4VHWAg",
+      "verify_at": 1700000030
+    },
+    {
+      "description": "Not a JWT — JOSE header decode fails",
+      "expect": "err:Malformed",
+      "name": "negative_malformed",
+      "token": "not.a.jwt",
+      "verify_at": 1700000030
+    },
+    {
+      "description": "Daemon mint with iat far in the future — verify_at < iat - leeway ⇒ NotYetValid",
+      "expect": "err:NotYetValid",
+      "name": "negative_not_yet_valid",
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ4ZzRpY213eGgza3gxb2Rhc3JqcXRrY213NmViOWJqNGg0azU3aTl5aHFlb3ptZXIxMzF5Iiwic3ViIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJpYXQiOjE3MDAwMDAwOTAsImV4cCI6MTcwMDAwMDE1MCwiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSIsIm5hbWUiOiJBbGljZSBRLiIsImF1dGhfbWV0aG9kIjoib2F1dGgifQ.MHGp6zX0Nz8u0KsxlFs3vmPJN4OUv9bAhyk03rEwDWtI5iTNKm8k8psQhqhy3ukfwYNozH-_AY7W_bYNu763Bw",
+      "verify_at": 1700000030
+    },
+    {
+      "description": "Signed by A but iss=B's peer_id; verifier configured with A's peer_id ⇒ sig OK but iss mismatch",
+      "expect": "err:IssuerMismatch",
+      "name": "negative_issuer_mismatch",
+      "token": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJicGRhcnh1dGJmcTdtZzk4dG1iOGR0bXM3aGhqOWI3c2VpbzRzYjZ4dWo4bTN3YnByYnlvIiwic3ViIjoiYWxpY2VAZXhhbXBsZS5jb20iLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMDA2MCwiZW1haWwiOiJhbGljZUBleGFtcGxlLmNvbSIsIm5hbWUiOiJBbGljZSBRLiIsImF1dGhfbWV0aG9kIjoib2F1dGgifQ.sXi2olZXVLaFe1mFyrQFzc7Ftqu9ZfNUsJfb5KKVsVotB3i2d8pfs3P1MEt37KQbVf1JlLY5h4CEkn7CwrmZDQ",
+      "verify_at": 1700000030
+    }
+  ],
+  "generated_by": "cargo run -p p2claw-agent --bin gen-identity-vectors",
+  "leeway_secs": 15,
+  "note": "Signature-bearing cases are minted by the daemon's actual `attestation::mint` (single source of truth for the wire format). Forged-shape cases (alg_none, alg_hs256, malformed, issuer_mismatch) are hand-constructed since the daemon would never emit them. All inputs deterministic: fixed Ed25519 seeds + fixed iat/exp. Verify-side tests pass `verify_at` as the `now` argument so the fixture never wall-clock-expires.",
+  "spec_version": "0.1",
+  "trusted_peer_id": "xg4icmwxh3kx1odasrjqtkcmw6eb9bj4h4k57i9yhqeozmer131y"
+}

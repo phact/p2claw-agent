@@ -1,0 +1,152 @@
+[package]
+name = "p2claw-agent"
+version = "0.10.20"
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+default-run = "p2claw"
+
+[lints]
+workspace = true
+
+[lib]
+# Exposes the routes / forwarder / hostname / validate modules so
+# integration tests can compose the real on-box handler.
+name = "p2claw_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "p2claw"
+path = "src/main.rs"
+
+# Regenerates `libs/identity-verify/test-vectors.json` from the
+# daemon's real `attestation::mint` path.
+[[bin]]
+name = "gen-identity-vectors"
+path = "src/bin/gen-identity-vectors.rs"
+
+[dependencies]
+# Workspace crates.
+p2claw-identity = { path = "../identity" }
+p2claw-control-proto = { path = "../control-proto" }
+p2claw-email-proto = { path = "../email-proto" }
+p2claw-translator = { path = "../translator" }
+p2claw-wire = { path = "../wire" }
+# Outbound peer-HTTP for the MagicDNS-routed dial path (`peer_dialer.rs`).
+p2claw-iroh-client = { path = "../p2claw-iroh-client" }
+
+# Async runtime + signal/IO.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "fs",
+    "signal",
+    "sync",
+    "time",
+] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tokio-stream = { version = "0.1", default-features = false }
+
+# CLI + tracing.
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serde.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors.
+thiserror = "2"
+
+# Bytes / encoding.
+bytes = "1"
+base64 = "0.22"
+
+# Randomness (backoff jitter).
+rand = "0.8"
+
+# Outbound HTTP for registration (POST /v1/register).
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-webpki-roots",
+    "json",
+    # Streaming downloads for the auto-upgrade tarball fetch.
+    "stream",
+] }
+
+# Local-API HTTP server over a Unix socket; client features cover the
+# reverse-proxy forwarder (`forwarder.rs`).
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client", "client-legacy", "http1"] }
+http-body-util = "0.1"
+http = "1"
+url = "2"
+
+# Iroh QUIC server (incoming peer connections).
+iroh = "1"
+
+# Local MagicDNS resolver (`dns_resolver.rs`). Pinned to the version
+# iroh already pulls in so the graph keeps a single copy.
+hickory-proto = { version = "0.26.0-beta.4", default-features = false }
+hickory-resolver = { version = "0.26.0-beta.4", default-features = false, features = ["system-config"] }
+
+# TLS termination for the local 443 SNI listener (`sni_listener.rs`):
+# `rustls::server::Acceptor` peeks the ClientHello for SNI, then
+# `tokio-rustls` completes the handshake with a per-SNI leaf cert.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+
+# Local CA (`local_ca.rs`): one per-installation root signs leaf certs
+# on demand for each `<app>-<alias>.<parent>` SNI. `pem` enables the
+# on-disk persistence path.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+# rcgen's date type for cert validity windows.
+time = { version = "0.3", default-features = false, features = ["std"] }
+
+# WebRTC server (incoming browser-visitor sessions): ICE + DTLS + SCTP
+# data channels in-tree.
+webrtc = "0.13"
+hex = "0.4"
+
+# Release version comparison for auto-upgrade (`auto_upgrade.rs`).
+semver = { version = "1", default-features = false }
+
+# SHA256SUMS verification for auto-upgrade downloads.
+sha2 = { version = "0.10", default-features = false }
+
+# Release tarball extraction for auto-upgrade
+# (`p2claw-v<version>-<os>-<arch>.tar.gz`).
+tar = { version = "0.4" }
+flate2 = { version = "1" }
+
+# `Uid::current()`; the SO_PEERCRED check itself goes through
+# `tokio::net::UnixStream::peer_cred`.
+nix = { version = "0.29", default-features = false, features = ["user"] }
+
+# EdDSA verification of the OAuth broker's ID-JWT (`oauth::jwt`).
+# v2 matches iroh's transitive choice so the graph keeps one copy.
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+
+# Terminal QR rendering for `p2claw apps expose` / `apps list --qr`.
+qrcode = { version = "0.14", default-features = false }
+
+# Bridges visitor WebSocket sessions to the local upstream WebSocket server.
+tokio-tungstenite = "0.24"
+
+# Inbox rendering: subject, text/html bodies and attachments out of the
+# stored RFC 5322 bytes.
+mail-parser = { version = "0.11", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+# The attestation integration test verifies the daemon's mint with the
+# same library downstream apps use.
+p2claw-identity-verify = { path = "../../libs/identity-verify/rust" }
+# `rand_core` lets tests generate throwaway broker keypairs.
+ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
+
+# Integration tests that need a live coordination server are kept out of
+# this crate, so it never depends on the server.

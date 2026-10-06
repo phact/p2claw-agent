@@ -1,0 +1,7 @@
+module p2claw_mobileFFI {
+    header "p2claw_mobileFFI.h"
+    export *
+    use "Darwin"
+    use "_Builtin_stdbool"
+    use "_Builtin_stdint"
+}

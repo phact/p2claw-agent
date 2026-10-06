@@ -1,0 +1,77 @@
+[package]
+name = "p2claw-mobile"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license = "MIT"
+
+[lints]
+workspace = true
+
+# `cdylib` produces the shared library Android consumes; `staticlib`
+# is what iOS prefers (bundled into an XCFramework alongside
+# WebRTC.framework); `lib` keeps the crate usable from other Rust
+# tests / consumers in the workspace.
+[lib]
+name = "p2claw_mobile"
+path = "src/lib.rs"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+# Bindgen entrypoint. Run as `cargo run --bin uniffi-bindgen -- generate
+# --library target/debug/libp2claw_mobile.so --language kotlin --out-dir
+# generated/kotlin` (and likewise for swift).
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+p2claw-wire = { path = "../wire" }
+# Device-binding auth: the SDK generates an Ed25519 device key + signs a
+# per-request proof of possession. The pubkey is z-base-32-encoded to
+# the same peer_id shape the broker + box expect, so identity provides
+# the encoding byte-for-byte.
+p2claw-identity = { path = "../identity" }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+
+# Sans-I/O internals use BytesMut for the codec buffer, but the public
+# surface deliberately speaks `Vec<u8>` so UniFFI bindings have a clean
+# ByteArray / Data mapping on Kotlin / Swift.
+bytes = "1"
+base64 = "0.22"
+
+# DTOs that mirror coord's signaling-WS JSON envelopes. The signaling
+# client itself owns no transport — platform supplies one via
+# [`signaling::SignalingTransport`], so reqwest / tokio-tungstenite /
+# rustls are deliberately absent.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Dyn-safe async traits for the signaling transport surface. UniFFI's
+# foreign-callback codegen consumes this shape directly.
+async-trait = "0.1"
+
+# FFI bindings generator. `cli` feature pulls in the bindgen binary code
+# we re-export from `src/bin/uniffi-bindgen.rs`; `tokio` provides the
+# async runtime adapter used by `#[uniffi::export(async_runtime = "tokio")]`
+# on `SignalingClient::connect`.
+uniffi = { version = "0.31", features = ["cli", "tokio"] }
+
+thiserror = "2"
+tracing = "0.1"
+
+# tokio's `rt` feature powers the executor that drives async UniFFI-
+# exported functions. We don't take any tokio types in the public
+# surface; this is internal to the runtime adapter.
+tokio = { version = "1", default-features = false, features = ["rt", "sync"] }
+
+[dev-dependencies]
+# Wire-vectors round-trip test reads the canonical JSON fixture.
+serde_json = "1"
+# Drives `#[tokio::test]` for the signaling-client unit tests, which
+# exercise the trait surface against an in-process mock transport.
+tokio = { version = "1", features = ["macros", "rt"] }
+hex = "0.4"
+# UniFFI's bindgen-tests harness lets us verify the generated
+# scaffolding round-trips through the FFI boundary without needing
+# JVM / Swift toolchains on the build host.
+uniffi = { version = "0.31", features = ["bindgen-tests"] }

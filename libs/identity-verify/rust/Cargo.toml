@@ -1,0 +1,40 @@
+[package]
+name = "p2claw-identity-verify"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+description = "Verify p2claw box-attested identity JWTs against a known peer_id."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/phact/p2claw-agent"
+keywords = ["jwt", "ed25519", "identity", "p2claw"]
+categories = ["authentication", "cryptography"]
+
+[lints]
+workspace = true
+
+[lib]
+name = "p2claw_identity_verify"
+path = "src/lib.rs"
+
+[dependencies]
+# Thin wrapper. EdDSA-aware JWT decoder; pinned to
+# `Algorithm::EdDSA` at every call site to defeat alg-substitution.
+jsonwebtoken = "9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Needed by `peek_jose_alg` to decode the JOSE header by hand
+# (sidesteps jsonwebtoken's strongly-typed `Algorithm` enum that
+# rejects unknown algs as a generic JSON error and masks the
+# alg-substitution attack signal).
+base64 = "0.22"
+
+[dev-dependencies]
+# Tests round-trip a freshly-minted token, which needs the signing
+# crypto. Verification itself doesn't pull ed25519-dalek;
+# jsonwebtoken handles signature verification via ring under the
+# hood.
+ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
+base64 = "0.22"
+hex = "0.4"
