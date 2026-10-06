@@ -1,0 +1,181 @@
+# Builds the `p2claw` binary for the four platforms the install script
+# (https://p2claw.com/install) and auto-upgrade download, and publishes them
+# as a GitHub release of this repository.
+#
+# Trigger: pushing a `v<version>` tag whose version matches
+# `crates/agent/Cargo.toml`. "Run workflow" by hand does a dry run: build and
+# smoke-test the current commit without publishing.
+#
+# Asset names (the install script and auto-upgrade depend on them):
+#   p2claw-v<version>-{macos-aarch64,macos-x86_64,linux-x86_64,linux-aarch64}.tar.gz
+#   SHA256SUMS
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        shell: bash
+        run: |
+          set -eu
+          VERSION="$(grep -m1 '^version' crates/agent/Cargo.toml | sed -E 's/version *= *"([^"]+)".*/\1/')"
+          [ -n "$VERSION" ] || { echo "::error::no version in crates/agent/Cargo.toml"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+              echo "::error::tag $GITHUB_REF_NAME doesn't match crates/agent/Cargo.toml version $VERSION"
+              exit 1
+            fi
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.asset }})
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: macos-aarch64
+          # Cross-compiled on Apple Silicon; the Xcode toolchain has both SDKs.
+          - os: macos-14
+            target: x86_64-apple-darwin
+            asset: macos-x86_64
+          # Pinned to Ubuntu 22.04 (glibc 2.35): binaries built against a
+          # newer glibc refuse to load on Debian 12, Ubuntu 22.04, RHEL 9 and
+          # most container bases. The floor check below enforces it.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: linux-aarch64
+    runs-on: ${{ matrix.os }}
+    env:
+      ASSET: p2claw-${{ needs.resolve.outputs.tag }}-${{ matrix.asset }}.tar.gz
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: install rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          # The runner image is part of the key: its glibc and linker
+          # determine the ABI of every cached rlib.
+          key: ${{ matrix.asset }}-${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.asset }}-${{ matrix.os }}-cargo-
+
+      - name: build
+        run: cargo build --release -p p2claw-agent --target ${{ matrix.target }}
+
+      - name: package
+        shell: bash
+        run: |
+          set -eu
+          STAGE="$(mktemp -d)"
+          cp "target/${{ matrix.target }}/release/p2claw" "$STAGE/p2claw"
+          tar -C "$STAGE" -czf "$ASSET" p2claw
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET" > "$ASSET.sha256"
+          else
+            shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          fi
+
+      - name: glibc floor check
+        if: ${{ contains(matrix.target, 'linux-gnu') }}
+        shell: bash
+        run: |
+          set -eu
+          HI="$(objdump -T "target/${{ matrix.target }}/release/p2claw" \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V -u | tail -n1)"
+          echo "highest GLIBC requirement: $HI"
+          MAX="GLIBC_2.35"
+          [ -n "$HI" ] || { echo "::error::no GLIBC symbols found"; exit 1; }
+          if [ "$(printf '%s\n%s\n' "$HI" "$MAX" | sort -V | tail -n1)" != "$MAX" ]; then
+            echo "::error::binary requires $HI; releases must need $MAX or older"
+            exit 1
+          fi
+
+      # Runs the binary and the service install path end to end without
+      # starting the agent, so CI never registers throwaway machines.
+      - name: smoke test
+        shell: bash
+        run: |
+          set -eu
+          SMOKE="$(mktemp -d)"
+          tar -C "$SMOKE" -xzf "$ASSET"
+          chmod +x "$SMOKE/p2claw"
+          "$SMOKE/p2claw" --version
+          "$SMOKE/p2claw" service install --bin-path "$SMOKE/p2claw" --no-start
+          "$SMOKE/p2claw" service uninstall
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: p2claw-${{ matrix.asset }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: [resolve, build]
+    if: ${{ needs.resolve.outputs.publish == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: SHA256SUMS
+        working-directory: artifacts
+        run: |
+          set -eu
+          cat *.tar.gz.sha256 > SHA256SUMS
+          rm *.tar.gz.sha256
+          cat SHA256SUMS
+
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: artifacts
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "p2claw $TAG" \
+            --notes "p2claw agent \`$TAG\`. Install with \`curl -fsSL https://p2claw.com/install | sh\`; installed agents upgrade automatically." \
+            ./*.tar.gz SHA256SUMS
