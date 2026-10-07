@@ -1444,7 +1444,7 @@ mod tests {
     #[test]
     fn latest_release_url_for_default_repo() {
         let url = latest_release_url(DEFAULT_RELEASE_REPO);
-        assert_eq!(url, "https://github.com/phact/p2claw-skill/releases/latest");
+        assert_eq!(url, "https://github.com/phact/p2claw-agent/releases/latest");
     }
 
     #[test]
