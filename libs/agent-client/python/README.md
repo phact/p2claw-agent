@@ -57,6 +57,10 @@ you answers 404, the same as one that doesn't exist.
 | `email_messages(unread=False)`, `email_message(id, raw=False)`, `email_attachment(id, aid)` | Read the inbox: listing without bodies, one message with bodies and attachments (or the raw RFC 5322 bytes), one attachment. |
 | `email_ack(id)`, `email_delete(id)`, `email_watch()` | Mark a message handled (it stays), remove it, or iterate over new message ids as they arrive. |
 | `email_rejected()` | Senders coordination turned away, with reasons. |
+| `oauth_grants_connect(provider, scopes, store=False)` | Start a consent flow through p2claw Connect with a fresh PKCE verifier and nonce. Show `flow.authorize_url` to the user; `flow.wait()` returns the exchange result once they approve. |
+| `oauth_grants_providers()`, `oauth_grants_start(...)`, `oauth_grants_wait(flow_id)`, `oauth_grants_exchange(flow_id, code_verifier, store=False)` | The individual steps, for apps that manage PKCE themselves. |
+| `oauth_grants_refresh(grant, provider)` | New access token for an app-managed grant. |
+| `oauth_grants()`, `oauth_grants_token(grant_id)`, `oauth_grants_revoke(grant_id)` | Grants the agent keeps: list them, get a current access token, revoke one at the provider. |
 | `fetch(peer, app, path, method=, headers=, body= / json_body=, stream=)` | HTTP to a private app on another machine. |
 | `websocket(peer, app, path, headers=)` | WebSocket to a private app on another machine. |
 

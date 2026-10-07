@@ -3,6 +3,7 @@
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import type WebSocket from "ws";
@@ -130,6 +131,62 @@ export interface EmailRejections extends EmailRejectionTotals {
   recent: EmailRejectedSender[];
 }
 
+export interface OauthProvider {
+  name: string;
+  scopes: string[];
+  revoke_url: string;
+}
+
+export interface OauthFlowStarted {
+  flow_id: string;
+  authorize_url: string;
+}
+
+export interface OauthFlowView {
+  flow_id: string;
+  provider: string;
+  status: "pending" | "ready" | "error" | "expired" | "consumed";
+  code?: string;
+  state?: string;
+  error?: string;
+}
+
+export interface OauthTokenResponse {
+  access_token: string;
+  expires_in: number;
+  scope?: string;
+  /** A replacement grant when the provider rotated the refresh token. */
+  grant?: string;
+}
+
+export interface OauthExchangeResult extends OauthTokenResponse {
+  provider: string;
+  /** Agent-managed exchanges (`store: true`) return the stored grant's id instead of the grant. */
+  grant_id?: string;
+}
+
+export interface OauthGrantSummary {
+  id: string;
+  provider: string;
+  scopes: string[];
+  /** Unix seconds. */
+  created_at: number;
+}
+
+export interface OauthAccessToken {
+  access_token: string;
+  expires_in: number;
+  scope?: string;
+}
+
+export interface OauthRevokeResult {
+  id: string;
+  provider: string;
+  /** `false` when the grant was dropped locally but the provider did not confirm. */
+  provider_revoked: boolean;
+  provider_error?: string;
+}
+
 export interface FetchOptions {
   method?: string;
   headers?: Record<string, string>;
@@ -244,11 +301,17 @@ export class AgentClient {
     });
   }
 
-  private async call<T>(method: string, target: string, payload?: unknown): Promise<T> {
+  private async call<T>(
+    method: string,
+    target: string,
+    payload?: unknown,
+    timeoutMs?: number,
+  ): Promise<T> {
     const body = payload === undefined ? undefined : JSON.stringify(payload);
     const res = await this.request(method, target, {
       body,
       headers: body === undefined ? {} : { "content-type": "application/json" },
+      timeoutMs,
     });
     const raw = await readAll(res);
     let parsed: unknown = undefined;
@@ -499,6 +562,123 @@ export class AgentClient {
     return this.call("GET", "/v1/email/rejected");
   }
 
+  // -- oauth grants -----------------------------------------------------
+
+  /** Providers and scopes available through p2claw Connect. */
+  async oauthGrantsProviders(): Promise<OauthProvider[]> {
+    return (await this.call<{ providers: OauthProvider[] }>("GET", "/v1/oauth-grants/providers"))
+      .providers;
+  }
+
+  /**
+   * Start a consent flow. `codeChallenge` is the PKCE S256 challenge,
+   * `nonceHash` the base64url SHA-256 of a one-time nonce. Show the
+   * returned `authorize_url` to the user. {@link AgentClient.oauthGrantsConnect}
+   * does all of this for you.
+   */
+  oauthGrantsStart(
+    provider: string,
+    scopes: string[],
+    codeChallenge: string,
+    nonceHash: string,
+  ): Promise<OauthFlowStarted> {
+    return this.call("POST", "/v1/oauth-grants/flows", {
+      provider,
+      scopes,
+      code_challenge: codeChallenge,
+      nonce_hash: nonceHash,
+    });
+  }
+
+  /**
+   * Wait for the user to finish consenting. Resolves with the flow once
+   * its status is no longer `pending`, or with the pending view when
+   * `timeoutMs` passes first.
+   */
+  async oauthGrantsWait(flowId: string, opts: { timeoutMs?: number } = {}): Promise<OauthFlowView> {
+    const base = `/v1/oauth-grants/flows/${encodeURIComponent(flowId)}`;
+    const deadline = opts.timeoutMs === undefined ? undefined : Date.now() + opts.timeoutMs;
+    for (;;) {
+      let pollSecs = WAIT_POLL_SECONDS;
+      let target = `${base}?wait=1`;
+      if (deadline !== undefined) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return this.call("GET", base);
+        pollSecs = Math.min(pollSecs, Math.max(1, Math.floor(remaining / 1000)));
+        target += `&timeout=${pollSecs}`;
+      }
+      const view = await this.call<OauthFlowView>("GET", target, undefined, (pollSecs + 15) * 1000);
+      if (view.status !== "pending") return view;
+    }
+  }
+
+  /**
+   * Exchange a finished flow for an access token. App-managed (default):
+   * the result carries `grant`; keep it with `provider` for
+   * {@link AgentClient.oauthGrantsRefresh}. Agent-managed (`store: true`):
+   * the agent keeps the grant and returns `grant_id` for
+   * {@link AgentClient.oauthGrantsToken}.
+   */
+  oauthGrantsExchange(
+    flowId: string,
+    codeVerifier: string,
+    opts: { store?: boolean } = {},
+  ): Promise<OauthExchangeResult> {
+    return this.call("POST", `/v1/oauth-grants/flows/${encodeURIComponent(flowId)}/exchange`, {
+      code_verifier: codeVerifier,
+      store: opts.store ?? false,
+    });
+  }
+
+  /**
+   * New access token for an app-managed grant. A returned `grant` replaces
+   * the stored one. Rejects with `AgentError` 410 `invalid_grant` when the
+   * provider no longer honours it.
+   */
+  oauthGrantsRefresh(grant: string, provider: string): Promise<OauthTokenResponse> {
+    return this.call("POST", "/v1/oauth-grants/refresh", { provider, grant });
+  }
+
+  /** Grants the agent keeps. */
+  async oauthGrants(): Promise<OauthGrantSummary[]> {
+    return (await this.call<{ grants: OauthGrantSummary[] }>("GET", "/v1/oauth-grants")).grants;
+  }
+
+  /**
+   * Current access token for a stored grant, refreshed as needed. Rejects
+   * with `AgentError` 410 `invalid_grant` (and drops the grant) when the
+   * provider rejects it.
+   */
+  oauthGrantsToken(grantId: string): Promise<OauthAccessToken> {
+    return this.call("GET", `/v1/oauth-grants/${encodeURIComponent(grantId)}/token`);
+  }
+
+  /** Revoke a stored grant at the provider and forget it. */
+  oauthGrantsRevoke(grantId: string): Promise<OauthRevokeResult> {
+    return this.call("DELETE", `/v1/oauth-grants/${encodeURIComponent(grantId)}`);
+  }
+
+  /**
+   * Start a consent flow with a fresh PKCE verifier and nonce. Show
+   * `flow.authorizeUrl` to the user, then `await flow.wait()` for the
+   * exchange result once they approve.
+   */
+  async oauthGrantsConnect(
+    provider: string,
+    scopes: string[],
+    opts: { store?: boolean } = {},
+  ): Promise<OauthGrantFlow> {
+    const codeVerifier = randomBytes(48).toString("base64url");
+    const nonce = randomBytes(24).toString("base64url");
+    const started = await this.oauthGrantsStart(
+      provider,
+      scopes,
+      b64urlSha256(codeVerifier),
+      b64urlSha256(nonce),
+    );
+    return new OauthGrantFlow(this, started, provider, scopes, opts.store ?? false, codeVerifier, nonce);
+  }
+
   private async callBytes(method: string, target: string): Promise<Buffer> {
     const res = await this.request(method, target);
     const raw = await readAll(res);
@@ -575,6 +755,77 @@ export class AgentClient {
     });
     return ws;
   }
+}
+
+/** Longest the agent holds a `?wait=1` poll before answering `pending`. */
+const WAIT_POLL_SECONDS = 55;
+
+/**
+ * A consent flow started by {@link AgentClient.oauthGrantsConnect}. Holds
+ * the PKCE verifier and nonce so {@link OauthGrantFlow.wait} can finish it.
+ */
+export class OauthGrantFlow {
+  readonly flowId: string;
+  readonly authorizeUrl: string;
+  private readonly nonceHash: string;
+
+  constructor(
+    private readonly client: AgentClient,
+    started: OauthFlowStarted,
+    readonly provider: string,
+    readonly scopes: string[],
+    readonly store: boolean,
+    private readonly codeVerifier: string,
+    nonce: string,
+  ) {
+    this.flowId = started.flow_id;
+    this.authorizeUrl = started.authorize_url;
+    this.nonceHash = b64urlSha256(nonce);
+  }
+
+  /**
+   * Wait until the user approves, check the callback carries this flow's
+   * nonce, and exchange. Rejects with `AgentError` `flow_pending` after
+   * `timeoutMs`, or `flow_error` / `flow_expired` / `state_mismatch` when
+   * the flow can't be finished.
+   */
+  async wait(opts: { timeoutMs?: number } = {}): Promise<OauthExchangeResult> {
+    const view = await this.client.oauthGrantsWait(this.flowId, opts);
+    if (view.status === "pending") {
+      throw new AgentError(0, "flow_pending", `flow ${this.flowId} is still waiting for the user`, view);
+    }
+    if (view.status !== "ready") {
+      throw new AgentError(0, `flow_${view.status}`, view.error, view);
+    }
+    if (stateNonceHash(view.state ?? "") !== this.nonceHash) {
+      throw new AgentError(0, "state_mismatch", "the callback is not for this flow", view);
+    }
+    return this.client.oauthGrantsExchange(this.flowId, this.codeVerifier, { store: this.store });
+  }
+}
+
+function b64urlSha256(data: string): string {
+  return createHash("sha256").update(data).digest("base64url");
+}
+
+/**
+ * The `nonce_hash` inside a broker-signed `state` (`s1.<json>.<sig>`). The
+ * signature is the broker's to check; the app only confirms the callback
+ * belongs to the flow it started.
+ */
+function stateNonceHash(state: string): string | undefined {
+  const parts = state.split(".");
+  if (parts.length !== 3 || parts[0] !== "s1") return undefined;
+  try {
+    const claims: unknown = JSON.parse(Buffer.from(parts[1]!, "base64url").toString("utf8"));
+    if (claims && typeof claims === "object") {
+      const nh = (claims as { nonce_hash?: unknown }).nonce_hash;
+      if (typeof nh === "string") return nh;
+    }
+  } catch {
+    // not a state we understand
+  }
+  return undefined;
 }
 
 /** The agent's canonical form: lower-case, plus-tag dropped. */

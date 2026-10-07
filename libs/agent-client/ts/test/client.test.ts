@@ -1,6 +1,7 @@
 import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import { mkdtempSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { WebSocketServer } from "ws";
@@ -234,5 +235,124 @@ describe("AgentClient", () => {
     if (process.platform === "linux") {
       expect(defaultSocketPath({ XDG_RUNTIME_DIR: "/run/user/1000" })).toBe("/run/user/1000/p2claw/agent.sock");
     }
+  });
+});
+
+function b64urlSha256(data: string): string {
+  return createHash("sha256").update(data).digest("base64url");
+}
+
+function stateFor(nonceHash: string): string {
+  const claims = JSON.stringify({ peer_id: "p", flow_id: "f_1", nonce_hash: nonceHash });
+  return `s1.${Buffer.from(claims).toString("base64url")}.sig`;
+}
+
+describe("AgentClient oauth grants", () => {
+  it("calls every oauth-grants endpoint", async () => {
+    agent.responses.set("GET /v1/oauth-grants/providers", [
+      200,
+      { providers: [{ name: "google", scopes: ["calendar.app.created"], revoke_url: "r" }] },
+    ]);
+    agent.responses.set("POST /v1/oauth-grants/flows", [
+      200,
+      { flow_id: "f_1", authorize_url: "https://accounts.google.com/x" },
+    ]);
+    agent.responses.set("GET /v1/oauth-grants/flows/f_1", [
+      200,
+      { flow_id: "f_1", status: "ready", code: "c0de", state: "s1.x.y" },
+    ]);
+    agent.responses.set("POST /v1/oauth-grants/flows/f_1/exchange", [
+      200,
+      { access_token: "at", expires_in: 3600, provider: "google", grant: "g1.k.z" },
+    ]);
+    agent.responses.set("POST /v1/oauth-grants/refresh", [200, { access_token: "at2", expires_in: 3600 }]);
+    agent.responses.set("GET /v1/oauth-grants", [
+      200,
+      { grants: [{ id: "gr_1", provider: "google", scopes: [], created_at: 1 }] },
+    ]);
+    agent.responses.set("GET /v1/oauth-grants/gr_1/token", [200, { access_token: "at3", expires_in: 100 }]);
+    agent.responses.set("DELETE /v1/oauth-grants/gr_1", [
+      200,
+      { id: "gr_1", provider: "google", provider_revoked: true },
+    ]);
+
+    expect((await client.oauthGrantsProviders())[0]!.name).toBe("google");
+    const started = await client.oauthGrantsStart("google", ["calendar.app.created"], "chal", "nh");
+    expect(started.flow_id).toBe("f_1");
+    expect(JSON.parse(agent.requests.at(-1)!.body)).toEqual({
+      provider: "google",
+      scopes: ["calendar.app.created"],
+      code_challenge: "chal",
+      nonce_hash: "nh",
+    });
+    expect((await client.oauthGrantsWait("f_1")).code).toBe("c0de");
+    expect(agent.requests.at(-1)!.url).toBe("/v1/oauth-grants/flows/f_1?wait=1");
+    expect((await client.oauthGrantsExchange("f_1", "verifier")).grant).toBe("g1.k.z");
+    expect(JSON.parse(agent.requests.at(-1)!.body)).toEqual({ code_verifier: "verifier", store: false });
+    await client.oauthGrantsExchange("f_1", "verifier", { store: true });
+    expect(JSON.parse(agent.requests.at(-1)!.body).store).toBe(true);
+    expect((await client.oauthGrantsRefresh("g1.k.z", "google")).access_token).toBe("at2");
+    expect(JSON.parse(agent.requests.at(-1)!.body)).toEqual({ provider: "google", grant: "g1.k.z" });
+    expect((await client.oauthGrants())[0]!.id).toBe("gr_1");
+    expect((await client.oauthGrantsToken("gr_1")).access_token).toBe("at3");
+    expect((await client.oauthGrantsRevoke("gr_1")).provider_revoked).toBe(true);
+    expect(agent.requests.at(-1)!.method).toBe("DELETE");
+
+    agent.responses.set("GET /v1/oauth-grants/gr_1/token", [410, { error: "invalid_grant" }]);
+    const err = await client.oauthGrantsToken("gr_1").catch((e: unknown) => e);
+    expect(err).toMatchObject({ status: 410, error: "invalid_grant" });
+  });
+
+  it("wait honours its timeout", async () => {
+    agent.responses.set("GET /v1/oauth-grants/flows/f_1", [200, { flow_id: "f_1", status: "pending" }]);
+    const view = await client.oauthGrantsWait("f_1", { timeoutMs: 200 });
+    expect(view.status).toBe("pending");
+    expect(agent.requests[0]!.url).toContain("wait=1&timeout=1");
+  });
+
+  it("connect runs the app side of a flow", async () => {
+    agent.responses.set("POST /v1/oauth-grants/flows", [
+      200,
+      { flow_id: "f_1", authorize_url: "https://accounts.google.com/x" },
+    ]);
+    agent.responses.set("POST /v1/oauth-grants/flows/f_1/exchange", [
+      200,
+      { access_token: "at", expires_in: 3600, provider: "google", grant_id: "gr_1" },
+    ]);
+    const flow = await client.oauthGrantsConnect("google", ["calendar.app.created"], { store: true });
+    expect([flow.flowId, flow.authorizeUrl]).toEqual(["f_1", "https://accounts.google.com/x"]);
+    const start = JSON.parse(agent.requests.at(-1)!.body);
+    expect(start.code_challenge).toHaveLength(43);
+    expect(start.nonce_hash).toHaveLength(43);
+
+    agent.responses.set("GET /v1/oauth-grants/flows/f_1", [
+      200,
+      { flow_id: "f_1", status: "ready", code: "c0de", state: stateFor(start.nonce_hash) },
+    ]);
+    const result = await flow.wait();
+    expect(result.grant_id).toBe("gr_1");
+    const exchange = JSON.parse(agent.requests.at(-1)!.body);
+    expect(exchange.store).toBe(true);
+    expect(b64urlSha256(exchange.code_verifier)).toBe(start.code_challenge);
+  });
+
+  it("connect rejects foreign callbacks and failed flows", async () => {
+    agent.responses.set("POST /v1/oauth-grants/flows", [200, { flow_id: "f_1", authorize_url: "u" }]);
+    const flow = await client.oauthGrantsConnect("google", ["s"]);
+    agent.responses.set("GET /v1/oauth-grants/flows/f_1", [
+      200,
+      { flow_id: "f_1", status: "ready", code: "c0de", state: stateFor("other") },
+    ]);
+    await expect(flow.wait()).rejects.toMatchObject({ error: "state_mismatch" });
+    expect(agent.requests.some((r) => r.url.includes("exchange"))).toBe(false);
+
+    agent.responses.set("GET /v1/oauth-grants/flows/f_1", [
+      200,
+      { flow_id: "f_1", status: "error", error: "access_denied" },
+    ]);
+    await expect(flow.wait()).rejects.toMatchObject({ error: "flow_error", detail: "access_denied" });
+
+    agent.responses.set("GET /v1/oauth-grants/flows/f_1", [200, { flow_id: "f_1", status: "pending" }]);
+    await expect(flow.wait({ timeoutMs: 100 })).rejects.toMatchObject({ error: "flow_pending" });
   });
 });

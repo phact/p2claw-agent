@@ -286,3 +286,154 @@ def test_websocket_through_the_proxy_path(tmp_path: Any) -> None:
             assert ws.recv() == "hi"
         server.shutdown()
     assert seen == ["/v1/proxy/blue-otter-7392/svc/ws"]
+
+
+def _b64url_sha256(data: bytes) -> str:
+    import base64
+    import hashlib
+
+    return base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+
+
+def _state_for(nonce_hash: str) -> str:
+    import base64
+
+    claims = json.dumps({"peer_id": "p", "flow_id": "f_1", "nonce_hash": nonce_hash}).encode()
+    return "s1." + base64.urlsafe_b64encode(claims).rstrip(b"=").decode() + ".sig"
+
+
+def test_oauth_grants_calls(agent: FakeAgent) -> None:
+    agent.responses[("GET", "/v1/oauth-grants/providers")] = (
+        200,
+        {"providers": [{"name": "google", "scopes": ["calendar.app.created"], "revoke_url": "r"}]},
+    )
+    agent.responses[("POST", "/v1/oauth-grants/flows")] = (
+        200,
+        {"flow_id": "f_1", "authorize_url": "https://accounts.google.com/x"},
+    )
+    agent.responses[("GET", "/v1/oauth-grants/flows/f_1")] = (
+        200,
+        {"flow_id": "f_1", "status": "ready", "code": "c0de", "state": "s1.x.y"},
+    )
+    agent.responses[("POST", "/v1/oauth-grants/flows/f_1/exchange")] = (
+        200,
+        {"access_token": "at", "expires_in": 3600, "provider": "google", "grant": "g1.k.z"},
+    )
+    agent.responses[("POST", "/v1/oauth-grants/refresh")] = (
+        200,
+        {"access_token": "at2", "expires_in": 3600},
+    )
+    agent.responses[("GET", "/v1/oauth-grants")] = (
+        200,
+        {"grants": [{"id": "gr_1", "provider": "google", "scopes": [], "created_at": 1}]},
+    )
+    agent.responses[("GET", "/v1/oauth-grants/gr_1/token")] = (
+        200,
+        {"access_token": "at3", "expires_in": 100},
+    )
+    agent.responses[("DELETE", "/v1/oauth-grants/gr_1")] = (
+        200,
+        {"id": "gr_1", "provider": "google", "provider_revoked": True},
+    )
+    c = client(agent)
+
+    assert c.oauth_grants_providers()[0]["name"] == "google"
+    started = c.oauth_grants_start("google", ["calendar.app.created"], "chal", "nh")
+    assert started["flow_id"] == "f_1"
+    assert json.loads(agent.requests[-1]["body"]) == {
+        "provider": "google",
+        "scopes": ["calendar.app.created"],
+        "code_challenge": "chal",
+        "nonce_hash": "nh",
+    }
+    assert c.oauth_grants_wait("f_1")["code"] == "c0de"
+    assert agent.requests[-1]["path"] == "/v1/oauth-grants/flows/f_1?wait=1"
+    assert c.oauth_grants_exchange("f_1", "verifier")["grant"] == "g1.k.z"
+    assert json.loads(agent.requests[-1]["body"]) == {"code_verifier": "verifier", "store": False}
+    c.oauth_grants_exchange("f_1", "verifier", store=True)
+    assert json.loads(agent.requests[-1]["body"])["store"] is True
+    assert c.oauth_grants_refresh("g1.k.z", "google")["access_token"] == "at2"
+    assert json.loads(agent.requests[-1]["body"]) == {"provider": "google", "grant": "g1.k.z"}
+    assert c.oauth_grants()[0]["id"] == "gr_1"
+    assert c.oauth_grants_token("gr_1")["access_token"] == "at3"
+    assert c.oauth_grants_revoke("gr_1")["provider_revoked"] is True
+    assert agent.requests[-1]["method"] == "DELETE"
+
+    agent.responses[("GET", "/v1/oauth-grants/gr_1/token")] = (410, {"error": "invalid_grant"})
+    with pytest.raises(AgentError) as e:
+        c.oauth_grants_token("gr_1")
+    assert (e.value.status, e.value.error) == (410, "invalid_grant")
+
+
+def test_oauth_grants_wait_honours_timeout(agent: FakeAgent) -> None:
+    agent.responses[("GET", "/v1/oauth-grants/flows/f_1")] = (
+        200,
+        {"flow_id": "f_1", "status": "pending"},
+    )
+    view = client(agent).oauth_grants_wait("f_1", timeout=0.2)
+    assert view["status"] == "pending"
+    assert "wait=1&timeout=1" in agent.requests[0]["path"]
+
+
+def test_oauth_grants_connect_runs_the_app_side(agent: FakeAgent) -> None:
+    agent.responses[("POST", "/v1/oauth-grants/flows")] = (
+        200,
+        {"flow_id": "f_1", "authorize_url": "https://accounts.google.com/x"},
+    )
+    agent.responses[("POST", "/v1/oauth-grants/flows/f_1/exchange")] = (
+        200,
+        {"access_token": "at", "expires_in": 3600, "provider": "google", "grant_id": "gr_1"},
+    )
+    c = client(agent)
+    flow = c.oauth_grants_connect("google", ["calendar.app.created"], store=True)
+    assert (flow.flow_id, flow.authorize_url) == ("f_1", "https://accounts.google.com/x")
+    start = json.loads(agent.requests[-1]["body"])
+    assert len(start["code_challenge"]) == 43 and len(start["nonce_hash"]) == 43
+
+    # The callback carries this flow's nonce hash in its state.
+    agent.responses[("GET", "/v1/oauth-grants/flows/f_1")] = (
+        200,
+        {
+            "flow_id": "f_1",
+            "status": "ready",
+            "code": "c0de",
+            "state": _state_for(start["nonce_hash"]),
+        },
+    )
+    result = flow.wait()
+    assert result["grant_id"] == "gr_1"
+    exchange = json.loads(agent.requests[-1]["body"])
+    assert exchange["store"] is True
+    assert _b64url_sha256(exchange["code_verifier"].encode()) == start["code_challenge"]
+
+
+def test_oauth_grants_connect_rejects_foreign_callbacks_and_failures(agent: FakeAgent) -> None:
+    agent.responses[("POST", "/v1/oauth-grants/flows")] = (
+        200,
+        {"flow_id": "f_1", "authorize_url": "u"},
+    )
+    c = client(agent)
+    flow = c.oauth_grants_connect("google", ["s"])
+    agent.responses[("GET", "/v1/oauth-grants/flows/f_1")] = (
+        200,
+        {"flow_id": "f_1", "status": "ready", "code": "c0de", "state": _state_for("other")},
+    )
+    with pytest.raises(AgentError) as e:
+        flow.wait()
+    assert e.value.error == "state_mismatch"
+    assert not any("exchange" in r["path"] for r in agent.requests)
+
+    agent.responses[("GET", "/v1/oauth-grants/flows/f_1")] = (
+        200,
+        {"flow_id": "f_1", "status": "error", "error": "access_denied"},
+    )
+    with pytest.raises(AgentError) as e:
+        flow.wait()
+    assert (e.value.error, e.value.detail) == ("flow_error", "access_denied")
+
+    agent.responses[("GET", "/v1/oauth-grants/flows/f_1")] = (
+        200,
+        {"flow_id": "f_1", "status": "pending"},
+    )
+    with pytest.raises(TimeoutError):
+        flow.wait(timeout=0.1)

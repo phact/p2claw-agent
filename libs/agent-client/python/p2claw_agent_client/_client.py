@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import http.client
 import json
 import os
+import secrets
 import socket
 import sys
+import time
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Any
 
@@ -14,12 +18,20 @@ __all__ = [
     "AgentClient",
     "AgentError",
     "AgentNotRunning",
+    "OauthGrantFlow",
     "Response",
     "StreamingResponse",
     "default_socket_path",
 ]
 
 Json = Any
+
+# Sentinel for "use the client's default timeout".
+_DEFAULT_TIMEOUT = -1.0
+
+# Longest the agent holds a `?wait=1` poll before answering `pending`;
+# the request timeout must outlast it.
+_WAIT_POLL_SECONDS = 55
 
 # Characters a URL would percent-encode; the agent reads a `unix:`
 # upstream path back verbatim, so they can't appear in a socket path.
@@ -160,10 +172,18 @@ class AgentClient:
             conn.close()
             raise
 
-    def _call(self, method: str, path: str, payload: Json = None) -> Json:
+    def _call(
+        self,
+        method: str,
+        path: str,
+        payload: Json = None,
+        timeout: float | None = _DEFAULT_TIMEOUT,
+    ) -> Json:
         body = None if payload is None else json.dumps(payload).encode()
         headers = {"content-type": "application/json"} if body is not None else {}
-        conn, resp = self._open(method, path, headers, body, self.timeout)
+        if timeout == _DEFAULT_TIMEOUT:
+            timeout = self.timeout
+        conn, resp = self._open(method, path, headers, body, timeout)
         try:
             raw = resp.read()
         finally:
@@ -388,6 +408,102 @@ class AgentClient:
         most recent senders."""
         return self._call("GET", "/v1/email/rejected")
 
+    # -- oauth grants ----------------------------------------------------
+
+    def oauth_grants_providers(self) -> list[Json]:
+        """Providers and scopes available through p2claw Connect:
+        `[{"name", "scopes", "revoke_url"}]`."""
+        return list(self._call("GET", "/v1/oauth-grants/providers")["providers"])
+
+    def oauth_grants_start(
+        self, provider: str, scopes: Iterable[str], code_challenge: str, nonce_hash: str
+    ) -> Json:
+        """Start a consent flow. `code_challenge` is the PKCE S256 challenge,
+        `nonce_hash` the base64url SHA-256 of a one-time nonce. Returns
+        `{"flow_id", "authorize_url"}`; show the URL to the user.
+
+        :meth:`oauth_grants_connect` does all of this for you."""
+        return self._call(
+            "POST",
+            "/v1/oauth-grants/flows",
+            {
+                "provider": provider,
+                "scopes": list(scopes),
+                "code_challenge": code_challenge,
+                "nonce_hash": nonce_hash,
+            },
+        )
+
+    def oauth_grants_wait(self, flow_id: str, timeout: float | None = None) -> Json:
+        """Wait for the user to finish consenting. Returns the flow
+        `{"status", "code", "state", "error"}` once its status is no longer
+        `pending`, or the pending view when `timeout` seconds pass first."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            path = f"/v1/oauth-grants/flows/{flow_id}?wait=1"
+            poll: float = _WAIT_POLL_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return self._call("GET", f"/v1/oauth-grants/flows/{flow_id}")
+                poll = min(poll, max(1.0, remaining))
+                path += f"&timeout={int(poll)}"
+            view = self._call("GET", path, timeout=poll + 15)
+            if view.get("status") != "pending":
+                return view
+
+    def oauth_grants_exchange(self, flow_id: str, code_verifier: str, store: bool = False) -> Json:
+        """Exchange a finished flow for an access token. App-managed
+        (`store=False`): `{"access_token", "expires_in", "scope", "provider",
+        "grant"}`; keep `grant` and `provider` for :meth:`oauth_grants_refresh`.
+        Agent-managed (`store=True`): the agent keeps the grant and returns
+        `grant_id` instead; use :meth:`oauth_grants_token`."""
+        return self._call(
+            "POST",
+            f"/v1/oauth-grants/flows/{flow_id}/exchange",
+            {"code_verifier": code_verifier, "store": store},
+        )
+
+    def oauth_grants_refresh(self, grant: str, provider: str) -> Json:
+        """New access token for an app-managed grant:
+        `{"access_token", "expires_in", "scope", "grant"?}`. A returned `grant`
+        replaces the stored one. Raises `AgentError` 410 `invalid_grant` when
+        the provider no longer honours it."""
+        return self._call(
+            "POST", "/v1/oauth-grants/refresh", {"provider": provider, "grant": grant}
+        )
+
+    def oauth_grants(self) -> list[Json]:
+        """Grants the agent keeps: `[{"id", "provider", "scopes", "created_at"}]`."""
+        return list(self._call("GET", "/v1/oauth-grants")["grants"])
+
+    def oauth_grants_token(self, grant_id: str) -> Json:
+        """Current access token for a stored grant, refreshed as needed:
+        `{"access_token", "expires_in", "scope"}`. Raises `AgentError` 410
+        `invalid_grant` (and drops the grant) when the provider rejects it."""
+        return self._call("GET", f"/v1/oauth-grants/{grant_id}/token")
+
+    def oauth_grants_revoke(self, grant_id: str) -> Json:
+        """Revoke a stored grant at the provider and forget it. The result's
+        `provider_revoked` says whether the provider confirmed."""
+        return self._call("DELETE", f"/v1/oauth-grants/{grant_id}")
+
+    def oauth_grants_connect(
+        self, provider: str, scopes: Iterable[str], *, store: bool = False
+    ) -> OauthGrantFlow:
+        """Start a consent flow with a fresh PKCE verifier and nonce. Show
+        `flow.authorize_url` to the user, then call `flow.wait()` to get the
+        exchange result once they approve."""
+        code_verifier = secrets.token_urlsafe(64)
+        nonce = secrets.token_urlsafe(32)
+        started = self.oauth_grants_start(
+            provider,
+            scopes,
+            _b64url_sha256(code_verifier.encode()),
+            _b64url_sha256(nonce.encode()),
+        )
+        return OauthGrantFlow(self, started, provider, list(scopes), store, code_verifier, nonce)
+
     def _call_bytes(self, method: str, path: str) -> bytes:
         conn, resp = self._open(method, path, {}, None, self.timeout)
         try:
@@ -477,6 +593,71 @@ class AgentClient:
             additional_headers=dict(headers or {}),
             open_timeout=open_timeout,
         )
+
+
+class OauthGrantFlow:
+    """A consent flow started by :meth:`AgentClient.oauth_grants_connect`.
+    Holds the PKCE verifier and nonce so :meth:`wait` can finish the flow."""
+
+    def __init__(
+        self,
+        client: AgentClient,
+        started: Json,
+        provider: str,
+        scopes: list[str],
+        store: bool,
+        code_verifier: str,
+        nonce: str,
+    ):
+        self._client = client
+        self.flow_id: str = started["flow_id"]
+        self.authorize_url: str = started["authorize_url"]
+        self.provider = provider
+        self.scopes = scopes
+        self.store = store
+        self._code_verifier = code_verifier
+        self._nonce_hash = _b64url_sha256(nonce.encode())
+
+    def wait(self, timeout: float | None = None) -> Json:
+        """Block until the user approves, check the callback carries this
+        flow's nonce, and exchange. Returns what
+        :meth:`AgentClient.oauth_grants_exchange` returns. Raises
+        `TimeoutError` after `timeout` seconds, `AgentError` when the flow
+        failed, expired or doesn't match."""
+        view = self._client.oauth_grants_wait(self.flow_id, timeout)
+        status = view.get("status")
+        if status == "pending":
+            raise TimeoutError(f"flow {self.flow_id} is still waiting for the user")
+        if status != "ready":
+            raise AgentError(0, f"flow_{status}", view.get("error"), view)
+        if _state_nonce_hash(str(view.get("state", ""))) != self._nonce_hash:
+            raise AgentError(0, "state_mismatch", "the callback is not for this flow", view)
+        return self._client.oauth_grants_exchange(
+            self.flow_id, self._code_verifier, store=self.store
+        )
+
+    def __repr__(self) -> str:
+        return f"<OauthGrantFlow {self.flow_id} {self.provider}>"
+
+
+def _b64url_sha256(data: bytes) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+
+
+def _state_nonce_hash(state: str) -> str | None:
+    """The `nonce_hash` inside a broker-signed `state` (`s1.<json>.<sig>`).
+    The signature is the broker's to check; the app only confirms the
+    callback belongs to the flow it started."""
+    parts = state.split(".")
+    if len(parts) != 3 or parts[0] != "s1":
+        return None
+    try:
+        padded = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(padded))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    nonce_hash = claims.get("nonce_hash") if isinstance(claims, dict) else None
+    return nonce_hash if isinstance(nonce_hash, str) else None
 
 
 def _normalize_address(addr: str) -> str:
