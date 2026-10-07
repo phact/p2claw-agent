@@ -1,6 +1,6 @@
 [package]
 name = "p2claw-agent"
-version = "0.10.21"
+version = "0.10.22"
 edition.workspace = true
 publish.workspace = true
 license = "MIT"
