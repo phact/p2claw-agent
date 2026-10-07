@@ -29,6 +29,9 @@ pub enum IdentityError {
     #[error("session_id too long (>65535 bytes)")]
     SessionIdTooLong,
 
+    #[error("signed field too long (>65535 bytes)")]
+    FieldTooLong,
+
     #[error("alias too long (>65535 bytes)")]
     AliasTooLong,
 }

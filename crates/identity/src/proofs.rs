@@ -26,6 +26,19 @@ pub const REGISTRATION_MAX_SKEW_SECS: u64 = 60;
 /// Maximum accepted clock skew for vanity-upgrade timestamps, in seconds.
 pub const ALIAS_UPGRADE_MAX_SKEW_SECS: u64 = 60;
 
+/// Domain separator for HTTP requests a box signs with its identity key.
+pub const BOX_REQUEST_DOMAIN_SEP: &[u8] = b"p2claw-box-request-v1";
+
+/// Maximum accepted clock skew for signed box requests, in seconds.
+pub const BOX_REQUEST_MAX_SKEW_SECS: u64 = 60;
+
+/// Headers carrying a signed box request: the signer's peer id (z-base-32),
+/// the Unix timestamp the signature covers, and the signature
+/// (base64url, no padding).
+pub const BOX_REQUEST_PEER_HEADER: &str = "x-p2claw-peer";
+pub const BOX_REQUEST_TIMESTAMP_HEADER: &str = "x-p2claw-timestamp";
+pub const BOX_REQUEST_SIGNATURE_HEADER: &str = "x-p2claw-signature";
+
 /// Build the canonical payload for a registration-proof signature:
 ///
 /// ```text
@@ -408,5 +421,172 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, IdentityError::BadSignature));
+    }
+}
+
+/// Build the canonical payload for a signed box request:
+///
+/// ```text
+///   "p2claw-box-request-v1" || 0x0A || pubkey
+///       || u16_be(len(host)) || host || u16_be(len(method)) || method
+///       || u16_be(len(path)) || path || u64_be(timestamp) || sha256(body)
+/// ```
+///
+/// `host` is the authority the request is sent to, so a signature for one
+/// service can't be replayed at another; `path` includes the query string.
+pub fn build_box_request_payload(
+    pubkey: &[u8; 32],
+    host: &str,
+    method: &str,
+    path: &str,
+    timestamp_secs: u64,
+    body_sha256: &[u8; 32],
+) -> Result<Vec<u8>, IdentityError> {
+    let mut out = Vec::with_capacity(
+        BOX_REQUEST_DOMAIN_SEP.len() + 1 + 32 + 6 + host.len() + method.len() + path.len() + 8 + 32,
+    );
+    out.extend_from_slice(BOX_REQUEST_DOMAIN_SEP);
+    out.push(0x0A);
+    out.extend_from_slice(pubkey);
+    for field in [host, method, path] {
+        let bytes = field.as_bytes();
+        if bytes.len() > u16::MAX as usize {
+            return Err(IdentityError::FieldTooLong);
+        }
+        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(bytes);
+    }
+    out.extend_from_slice(&timestamp_secs.to_be_bytes());
+    out.extend_from_slice(body_sha256);
+    Ok(out)
+}
+
+/// Sign an HTTP request as this box. Caller supplies the clock and the
+/// body's SHA-256.
+pub fn sign_box_request(
+    sk: &SigningKey,
+    host: &str,
+    method: &str,
+    path: &str,
+    timestamp_secs: u64,
+    body_sha256: &[u8; 32],
+) -> Result<Signature, IdentityError> {
+    let payload = build_box_request_payload(
+        sk.peer_id().as_bytes(),
+        host,
+        method,
+        path,
+        timestamp_secs,
+        body_sha256,
+    )?;
+    Ok(sk.sign(&payload))
+}
+
+/// Verify a signed box request and its clock skew
+/// ([`BOX_REQUEST_MAX_SKEW_SECS`]).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_box_request(
+    peer_id: &PeerId,
+    host: &str,
+    method: &str,
+    path: &str,
+    timestamp_secs: u64,
+    body_sha256: &[u8; 32],
+    sig: &Signature,
+    now_secs: u64,
+) -> Result<(), IdentityError> {
+    let skew = now_secs.abs_diff(timestamp_secs);
+    if skew > BOX_REQUEST_MAX_SKEW_SECS {
+        return Err(IdentityError::ClockSkew {
+            skew,
+            max: BOX_REQUEST_MAX_SKEW_SECS,
+        });
+    }
+    let payload = build_box_request_payload(
+        peer_id.as_bytes(),
+        host,
+        method,
+        path,
+        timestamp_secs,
+        body_sha256,
+    )?;
+    VerifyingKey::from_peer_id(peer_id)?.verify(&payload, sig)
+}
+
+#[cfg(test)]
+mod box_request_tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip_and_tamper() {
+        let sk = SigningKey::generate();
+        let body = [7u8; 32];
+        let sig = sign_box_request(
+            &sk,
+            "oauth.p2claw.com",
+            "POST",
+            "/connect/google/refresh",
+            1000,
+            &body,
+        )
+        .unwrap();
+        let pid = sk.peer_id();
+        verify_box_request(
+            &pid,
+            "oauth.p2claw.com",
+            "POST",
+            "/connect/google/refresh",
+            1000,
+            &body,
+            &sig,
+            1030,
+        )
+        .unwrap();
+        assert!(verify_box_request(
+            &pid,
+            "evil.example",
+            "POST",
+            "/connect/google/refresh",
+            1000,
+            &body,
+            &sig,
+            1030
+        )
+        .is_err());
+        assert!(verify_box_request(
+            &pid,
+            "oauth.p2claw.com",
+            "POST",
+            "/connect/google/exchange",
+            1000,
+            &body,
+            &sig,
+            1030
+        )
+        .is_err());
+        assert!(verify_box_request(
+            &pid,
+            "oauth.p2claw.com",
+            "POST",
+            "/connect/google/refresh",
+            1000,
+            &[8u8; 32],
+            &sig,
+            1030
+        )
+        .is_err());
+        assert!(matches!(
+            verify_box_request(
+                &pid,
+                "oauth.p2claw.com",
+                "POST",
+                "/connect/google/refresh",
+                1000,
+                &body,
+                &sig,
+                1100
+            ),
+            Err(IdentityError::ClockSkew { .. })
+        ));
     }
 }

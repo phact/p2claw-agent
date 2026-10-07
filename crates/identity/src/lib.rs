@@ -19,11 +19,13 @@ pub use error::IdentityError;
 pub use keypair::{SecretKey, SigningKey, VerifyingKey};
 pub use peer_id::{PeerId, ALIAS_BASE_LEN, ALIAS_MAX_LEN, PEER_ID_Z32_LEN};
 pub use proofs::{
-    build_alias_binding_payload, build_alias_upgrade_payload, build_dtls_fp_payload,
-    build_registration_payload, sign_alias_binding, sign_alias_upgrade, sign_dtls_fp,
-    sign_registration, verify_alias_binding, verify_alias_upgrade, verify_dtls_fp,
-    verify_registration, ALIAS_BINDING_DOMAIN_SEP, ALIAS_UPGRADE_DOMAIN_SEP,
-    ALIAS_UPGRADE_MAX_SKEW_SECS, DTLS_FP_DOMAIN_SEP, REGISTRATION_DOMAIN_SEP,
+    build_alias_binding_payload, build_alias_upgrade_payload, build_box_request_payload,
+    build_dtls_fp_payload, build_registration_payload, sign_alias_binding, sign_alias_upgrade,
+    sign_box_request, sign_dtls_fp, sign_registration, verify_alias_binding, verify_alias_upgrade,
+    verify_box_request, verify_dtls_fp, verify_registration, ALIAS_BINDING_DOMAIN_SEP,
+    ALIAS_UPGRADE_DOMAIN_SEP, ALIAS_UPGRADE_MAX_SKEW_SECS, BOX_REQUEST_DOMAIN_SEP,
+    BOX_REQUEST_MAX_SKEW_SECS, BOX_REQUEST_PEER_HEADER, BOX_REQUEST_SIGNATURE_HEADER,
+    BOX_REQUEST_TIMESTAMP_HEADER, DTLS_FP_DOMAIN_SEP, REGISTRATION_DOMAIN_SEP,
     REGISTRATION_MAX_SKEW_SECS,
 };
 pub use zbase32::{decode as zbase32_decode, encode as zbase32_encode, Z32_ALPHABET};

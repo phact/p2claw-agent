@@ -816,6 +816,9 @@ async fn session(
                         debug!(count, "coord_conn: email_pending");
                         drain_notify.notify_one();
                     }
+                    Message::OauthGrantCallback { flow_id, .. } => {
+                        debug!(%flow_id, "coord_conn: oauth grant callback ignored (not supported yet)");
+                    }
                     Message::Hello { .. }
                     | Message::AddrsUpdate { .. }
                     | Message::Goodbye { .. }

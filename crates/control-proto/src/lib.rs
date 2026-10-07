@@ -162,6 +162,19 @@ pub enum Message {
     /// the queue is non-empty and whenever new mail arrives. The box
     /// drains the queue over an [`StreamKind::Email`] stream.
     EmailPending { count: u32 },
+
+    /// S → C. An OAuth provider redirected back for a flow this box
+    /// started. Carries the authorization `code` (or the provider's
+    /// `error`, e.g. `access_denied`) and the broker-signed `state`; the
+    /// box matches `flow_id` to its pending flow. Not stored by coord.
+    OauthGrantCallback {
+        flow_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+        state: String,
+    },
 }
 
 /// One row of a [`Message::RouteAnnounce`]. `registered_at` is Unix
