@@ -15,10 +15,9 @@
 //! [`stream`] (the `email` stream protocol) and [`drain`] (pulling the
 //! queue into the inbox).
 
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) use crate::fs_atomic::write_atomic_0600;
 
 pub mod drain;
 pub mod forwarding;
@@ -95,56 +94,6 @@ pub(crate) fn now_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Write `bytes` to `path` atomically: temp file next to it, mode
-/// 0600, fsync, rename.
-pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-        }
-    }
-    let tmp = temp_path(path);
-    write_file_0600(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(|n| n.to_os_string())
-        .unwrap_or_default();
-    name.push(".tmp");
-    match path.parent() {
-        Some(p) => p.join(name),
-        None => name.into(),
-    }
-}
-
-#[cfg(unix)]
-fn write_file_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_file_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    fs::write(path, bytes)
 }
 
 #[cfg(test)]

@@ -139,6 +139,9 @@ tokio-tungstenite = "0.24"
 # stored RFC 5322 bytes.
 mail-parser = { version = "0.11", default-features = false }
 
+# Flow and grant ids for OAuth grants (`f_<ULID>`, `gr_<ULID>`).
+ulid = "1"
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
@@ -147,6 +150,8 @@ tokio = { version = "1", features = ["full"] }
 p2claw-identity-verify = { path = "../../libs/identity-verify/rust" }
 # `rand_core` lets tests generate throwaway broker keypairs.
 ed25519-dalek = { version = "2", features = ["std", "rand_core"] }
+# Mock OAuth broker for the oauth-grants tests.
+axum = "0.7"
 
 # Integration tests that need a live coordination server are kept out of
 # this crate, so it never depends on the server.

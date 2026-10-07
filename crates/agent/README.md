@@ -86,12 +86,13 @@ keeps your alias.
 | `apps share` / `unshare` / `shares` | Share a private app with specific peers, revoke, and list shares. |
 | `apps connect <peer>/<app> [--listen addr]` | Use a private app another machine shared with you: serves it on a local port (HTTP and WebSockets), forwarding through the agent on this machine. |
 | `email …` | Inbound email for this machine: `enable` / `disable`, `allow` / `disallow` senders, `forwarding` (Gmail), `list` / `show` / `attachment` / `ack` / `rm` / `watch`, `rejected`. With no subcommand, prints a summary. See [Email](#email). |
+| `oauth-grants …` | OAuth grants for apps on this machine through p2claw Connect: `providers`, `start` / `wait` / `exchange [--store]`, `refresh`, `list` / `token` / `revoke`. See [OAuth grants](#oauth-grants). |
 | `service install` / `uninstall` / `status` / `config-check` | Manage the agent as a user-scope OS service (launchd on macOS, `systemd --user` on Linux). `install --system` installs a machine-scope service with the MagicDNS pieces (SNI listener on 443, local resolver, local CA) and needs sudo. |
 | `upgrade --check` / `--apply` / `--pin <ver>` / `--unpin` / `--disable` / `--enable` / `--status` | Drive or control auto-upgrade by hand. |
 
-Every subcommand accepts `--help`. All `apps`, `email`, `status`, and
-`sessions` commands talk to the running agent over a Unix-domain socket, so
-`p2claw run` (or the installed service) must be up.
+Every subcommand accepts `--help`. All `apps`, `email`, `oauth-grants`,
+`status`, and `sessions` commands talk to the running agent over a
+Unix-domain socket, so `p2claw run` (or the installed service) must be up.
 
 ### Authenticated apps
 
@@ -170,6 +171,45 @@ The same operations are available on the local API under `/v1/email`, and
 the Python and Node client libraries expose them as `email_*` /
 `email*` methods, so apps on the machine can read the inbox directly.
 
+## OAuth grants
+
+An app on this machine can get a user's permission to call a provider API
+(Google Calendar first) through **p2claw Connect**, without registering an
+OAuth client of its own. The app asks the agent to start a flow and shows
+the user a consent link; the user approves "p2claw Connect" at the
+provider; the callback reaches the agent through the coordination server,
+and the agent turns it into an access token. The p2claw OAuth broker holds
+the provider client secret and does the code exchange and refreshes, but
+keeps nothing: the grant it returns is sealed to this machine's identity
+key and lives only here. A copy taken off the machine is useless.
+
+The app picks who keeps the grant:
+
+- **App-managed:** the exchange returns the grant to the app, which stores
+  it and asks the agent to refresh it when the access token expires.
+- **Agent-managed:** the agent keeps the grant in `oauth-grants.json` in its
+  data directory and hands out access tokens on request, refreshing behind
+  the call. `list` and `revoke` work on these grants.
+
+```sh
+p2claw oauth-grants providers                      # providers and scopes on offer
+p2claw oauth-grants start google --scope calendar.app.created \
+    --challenge <pkce challenge> --nonce-hash <hash>   # prints the flow id and consent URL
+p2claw oauth-grants wait <flow id>                 # blocks until the user approves
+p2claw oauth-grants exchange <flow id> --verifier <pkce verifier> --store
+p2claw oauth-grants list
+p2claw oauth-grants token <grant id>               # a current access token
+p2claw oauth-grants revoke <grant id>              # revoke at the provider and forget
+p2claw oauth-grants refresh google < grant.txt     # app-managed grants
+```
+
+The same operations are available on the local API under
+`/v1/oauth-grants`, and the Python and Node client libraries expose them as
+`oauth_grants_*` / `oauthGrants*` methods, including a helper that runs the
+whole app side of a flow (PKCE, nonce, wait, exchange) in one call. Anything
+that can reach the agent's socket can get tokens from stored grants, the
+same trust boundary as the rest of the local API.
+
 ## Configuration
 
 The agent is configured through environment variables (and, for the first
@@ -179,7 +219,7 @@ two, matching CLI flags).
 |---|---|---|
 | `P2CLAW_COORD_DOMAIN` (`--coord-domain`) | `coord.p2claw.com` | Coordination server FQDN. Bound into the registration signature, so it must match what the server verifies against. Used by `run` and `register`. |
 | `P2CLAW_COORD_URL` (`--coord-url`) | `https://<coord_domain>` | Scheme + host for the coordination HTTP endpoint. Override for local servers such as `http://127.0.0.1:8081`. |
-| `P2CLAW_AGENT_OAUTH_BROKER_URL` | `https://oauth.p2claw.com` | OAuth broker whose JWKS the agent trusts for `--auth-oauth` apps. |
+| `P2CLAW_AGENT_OAUTH_BROKER_URL` | `https://oauth.p2claw.com` | OAuth broker whose JWKS the agent trusts for `--auth-oauth` apps, and which brokers `oauth-grants` flows. |
 | `P2CLAW_AGENT_STUN_URL` | `stun:stun.cloudflare.com:3478` | STUN server used to gather server-reflexive ICE candidates for browser visitors. Set to an empty string to disable STUN. |
 | `P2CLAW_AGENT_DATA_DIR` | `$XDG_DATA_HOME/p2claw` on Linux, `~/Library/Application Support/p2claw` on macOS | Holds `identity.key`, `agent.state`, the route table, and auto-upgrade policy files. |
 | `P2CLAW_AGENT_RUNTIME_DIR` | `$XDG_RUNTIME_DIR/p2claw`, else `/run/p2claw` as root | Holds `agent.sock`, the local-API Unix socket. |

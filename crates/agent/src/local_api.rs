@@ -36,8 +36,11 @@
 //! - `GET /v1/routes/<name>` → one route.
 //! - `DELETE /v1/routes/<name>` → remove a route.
 //! - `/v1/email/...` → inbound mail settings and inbox (`email.rs`).
+//! - `/v1/oauth-grants/...` → consent flows and grants through p2claw
+//!   Connect (`oauth_grants.rs`).
 
 mod email;
+mod oauth_grants;
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -61,6 +64,7 @@ use crate::config;
 use crate::email_link::{EmailLink, EmailShared};
 use crate::route_announcer::{AnnounceWaitError, RouteAnnouncer};
 use crate::state_store::AgentState;
+use p2claw_agent::oauth_grants::OauthGrants;
 use p2claw_agent::peer_dialer::PeerClientCache;
 use p2claw_agent::routes::{RouteError, RouteRecord, RouteTable, Visibility};
 use p2claw_agent::shares::{ShareError, ShareRecord, Shares};
@@ -175,6 +179,9 @@ pub struct LocalApi {
     /// Bridge to the coord session for `email_config` and rejection
     /// lookups.
     pub email_link: EmailLink,
+    /// Consent flows and stored grants; the coord session delivers
+    /// callbacks into its flow table.
+    pub oauth_grants: Arc<OauthGrants>,
 }
 
 impl LocalApi {
@@ -195,6 +202,7 @@ impl LocalApi {
         peer_proxy: Arc<std::sync::OnceLock<Arc<PeerClientCache>>>,
         email: EmailShared,
         email_link: EmailLink,
+        oauth_grants: Arc<OauthGrants>,
     ) -> Self {
         Self {
             identity,
@@ -210,6 +218,7 @@ impl LocalApi {
             peer_proxy,
             email,
             email_link,
+            oauth_grants,
         }
     }
 }
@@ -383,6 +392,9 @@ async fn dispatch(api: Arc<LocalApi>, req: Request<Incoming>) -> Response<ApiBod
             }
             if path == "/v1/email" || path.starts_with("/v1/email/") {
                 return email::dispatch(&api, req, &method, &path).await;
+            }
+            if path == "/v1/oauth-grants" || path.starts_with("/v1/oauth-grants/") {
+                return oauth_grants::dispatch(&api, req, &method, &path).await;
             }
             if let Some(name) = path.strip_prefix("/v1/routes/") {
                 if name.is_empty() || name.contains('/') {
@@ -1252,7 +1264,7 @@ mod tests {
     /// suppress the ack entirely (offline-control case) just don't
     /// spawn one.
     #[derive(Clone)]
-    enum AckMode {
+    pub(super) enum AckMode {
         AcceptAll,
         RejectName {
             name: String,
@@ -1375,9 +1387,34 @@ mod tests {
         tokio::task::JoinHandle<()>,
         tempfile::TempDir,
     ) {
+        make_api_with_broker(mode, "http://127.0.0.1:9")
+    }
+
+    /// Grant manager against `broker_url`, storing under `dir`.
+    pub(super) fn test_oauth_grants(
+        sk: &Arc<SigningKey>,
+        dir: &Path,
+        broker_url: &str,
+    ) -> Arc<OauthGrants> {
+        let broker =
+            p2claw_agent::oauth_grants::BrokerClient::new(broker_url, Arc::clone(sk)).unwrap();
+        let store =
+            p2claw_agent::oauth_grants::GrantStore::load_or_empty(dir.join("oauth-grants.json"));
+        Arc::new(OauthGrants::new(broker, store))
+    }
+
+    pub(super) fn make_api_with_broker(
+        mode: AckMode,
+        broker_url: &str,
+    ) -> (
+        Arc<LocalApi>,
+        tokio::task::JoinHandle<()>,
+        tempfile::TempDir,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let routes = RouteTable::load_or_empty(tmp.path().join("routes.json"));
         let sk = Arc::new(SigningKey::generate());
+        let oauth_grants = test_oauth_grants(&sk, tmp.path(), broker_url);
         let (announcer, inbox) = RouteAnnouncer::new();
         let acker = spawn_acker(inbox, mode);
         let (email_link, email_inbox) = EmailLink::new();
@@ -1407,6 +1444,7 @@ mod tests {
             Arc::new(std::sync::OnceLock::new()),
             email,
             email_link,
+            oauth_grants,
         ));
         (api, acker, tmp)
     }
@@ -1418,6 +1456,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let routes = RouteTable::load_or_empty(tmp.path().join("routes.json"));
         let sk = Arc::new(SigningKey::generate());
+        let oauth_grants = test_oauth_grants(&sk, tmp.path(), "http://127.0.0.1:9");
         let (announcer, inbox) = RouteAnnouncer::new();
         let api = Arc::new(LocalApi::new(
             sk,
@@ -1443,11 +1482,12 @@ mod tests {
             Arc::new(std::sync::OnceLock::new()),
             EmailShared::load(tmp.path()),
             EmailLink::new().0,
+            oauth_grants,
         ));
         (api, inbox, tmp)
     }
 
-    async fn http_over_uds(sock: &Path, raw: &[u8]) -> String {
+    pub(super) async fn http_over_uds(sock: &Path, raw: &[u8]) -> String {
         let mut s = UnixStream::connect(sock).await.unwrap();
         s.write_all(raw).await.unwrap();
         let mut buf = Vec::new();
@@ -1569,7 +1609,7 @@ mod tests {
         let (announcer, _inbox) = RouteAnnouncer::new();
         let sk = Arc::new(SigningKey::generate());
         let api = Arc::new(LocalApi::new(
-            sk,
+            Arc::clone(&sk),
             None,
             routes,
             announcer,
@@ -1582,6 +1622,7 @@ mod tests {
             Arc::new(std::sync::OnceLock::new()),
             EmailShared::load(tmp.path()),
             EmailLink::new().0,
+            test_oauth_grants(&sk, tmp.path(), "http://127.0.0.1:9"),
         ));
 
         let dir = tempfile::tempdir().unwrap();
@@ -2792,7 +2833,7 @@ Content-Disposition: attachment; filename=\"note.txt\"\r\n\
 attached note\r\n\
 --b--\r\n";
 
-    fn request(method: &str, path: &str, body: Option<&str>) -> Vec<u8> {
+    pub(super) fn request(method: &str, path: &str, body: Option<&str>) -> Vec<u8> {
         let mut req =
             format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n");
         if let Some(b) = body {
@@ -2808,7 +2849,7 @@ attached note\r\n\
         req.into_bytes()
     }
 
-    fn body_json(text: &str) -> serde_json::Value {
+    pub(super) fn body_json(text: &str) -> serde_json::Value {
         let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
         serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {text}"))
     }

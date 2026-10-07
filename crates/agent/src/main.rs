@@ -30,6 +30,7 @@ use tracing_subscriber::EnvFilter;
 // itself.
 mod cli_client;
 mod cli_email;
+mod cli_oauth_grants;
 mod config;
 mod connect;
 mod coord_conn;
@@ -172,6 +173,14 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// OAuth grants for apps on this machine through p2claw Connect:
+    /// a user consents once to a provider (Google Calendar first) and
+    /// apps here get access tokens without an OAuth client of their
+    /// own. Talks to the running agent's local API.
+    OauthGrants {
+        #[command(subcommand)]
+        command: OauthGrantsCmd,
+    },
     /// Auto-upgrade orchestrator surface. The running daemon
     /// checks for the latest GitHub release hourly under its
     /// supervisor; this CLI
@@ -213,6 +222,91 @@ enum Cmd {
         /// network IO.
         #[arg(long)]
         status: bool,
+    },
+}
+
+/// Subcommand tree for OAuth grants.
+#[derive(Subcommand, Debug)]
+enum OauthGrantsCmd {
+    /// Providers and scopes available through p2claw Connect.
+    Providers {
+        /// Emit the raw JSON from the local API.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start a consent flow: prints the flow id and the URL the user
+    /// opens to approve. The PKCE challenge and nonce hash come from
+    /// the app; keep the verifier and nonce for `exchange`.
+    Start {
+        /// Provider name, as listed by `providers` (e.g. `google`).
+        provider: String,
+        /// Scope to request. Repeat for several.
+        #[arg(long = "scope", required = true, value_name = "SCOPE")]
+        scopes: Vec<String>,
+        /// PKCE S256 code challenge: base64url SHA-256 of the verifier.
+        #[arg(long, value_name = "CHALLENGE")]
+        challenge: String,
+        /// base64url SHA-256 of the app's one-time nonce.
+        #[arg(long, value_name = "HASH")]
+        nonce_hash: String,
+        /// Emit the raw JSON from the local API.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait for the user to finish consenting, then print the
+    /// callback's code and state. Exits non-zero if the flow failed
+    /// or expired.
+    Wait {
+        /// Flow id, as printed by `start`.
+        flow_id: String,
+        /// Emit the raw JSON from the local API.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Exchange a finished flow for an access token. Without
+    /// `--store` the grant is printed for the app to keep; with it
+    /// the agent keeps the grant and prints its id.
+    Exchange {
+        /// Flow id, as printed by `start`.
+        flow_id: String,
+        /// The PKCE verifier the challenge was derived from.
+        #[arg(long, value_name = "VERIFIER")]
+        verifier: String,
+        /// Keep the grant in the agent; use `token <id>` afterwards.
+        #[arg(long)]
+        store: bool,
+        /// Emit the raw JSON from the local API.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Refresh an app-managed grant read from stdin. Prints the new
+    /// access token and, if the provider rotated it, the new grant.
+    Refresh {
+        /// Provider the grant belongs to.
+        provider: String,
+        /// Emit the raw JSON from the local API.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Grants the agent keeps: id, provider, scopes, creation time.
+    List {
+        /// Emit the raw JSON from the local API.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a current access token for a stored grant, refreshing
+    /// it if needed.
+    Token {
+        /// Grant id, as listed by `list`.
+        id: String,
+        /// Emit the raw JSON from the local API.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a stored grant at the provider and forget it.
+    Revoke {
+        /// Grant id, as listed by `list`.
+        id: String,
     },
 }
 
@@ -680,6 +774,7 @@ fn main() -> ExitCode {
             // live as `apps unexpose` / `apps list`.
             Cmd::Apps { command } => cmd_apps(command).await,
             Cmd::Email { command, json } => cmd_email(command, json).await,
+            Cmd::OauthGrants { command } => cmd_oauth_grants(command).await,
             Cmd::Service { command } => cmd_service(command).await,
             Cmd::Upgrade {
                 check,
@@ -784,6 +879,31 @@ async fn cmd_email(cmd: Option<EmailCmd>, json: bool) -> ExitCode {
         Some(EmailCmd::Rm { id }) => cli_email::cmd_rm(id).await,
         Some(EmailCmd::Watch) => cli_email::cmd_watch().await,
         Some(EmailCmd::Rejected { json }) => cli_email::cmd_rejected(json).await,
+    }
+}
+
+async fn cmd_oauth_grants(cmd: OauthGrantsCmd) -> ExitCode {
+    use cli_oauth_grants as og;
+    match cmd {
+        OauthGrantsCmd::Providers { json } => og::cmd_providers(json).await,
+        OauthGrantsCmd::Start {
+            provider,
+            scopes,
+            challenge,
+            nonce_hash,
+            json,
+        } => og::cmd_start(provider, scopes, challenge, nonce_hash, json).await,
+        OauthGrantsCmd::Wait { flow_id, json } => og::cmd_wait(flow_id, json).await,
+        OauthGrantsCmd::Exchange {
+            flow_id,
+            verifier,
+            store,
+            json,
+        } => og::cmd_exchange(flow_id, verifier, store, json).await,
+        OauthGrantsCmd::Refresh { provider, json } => og::cmd_refresh(provider, json).await,
+        OauthGrantsCmd::List { json } => og::cmd_list(json).await,
+        OauthGrantsCmd::Token { id, json } => og::cmd_token(id, json).await,
+        OauthGrantsCmd::Revoke { id } => og::cmd_revoke(id).await,
     }
 }
 
@@ -1315,6 +1435,14 @@ async fn cmd_register(paths: &config::Paths, coord_url: &str, coord_domain: &str
     }
 }
 
+/// Broker the agent trusts for visitor sign-in and OAuth grants.
+fn oauth_broker_url() -> String {
+    std::env::var("P2CLAW_AGENT_OAUTH_BROKER_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| p2claw_agent::oauth::DEFAULT_BROKER_URL.to_string())
+}
+
 async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> ExitCode {
     let sk = match SigningKey::load_or_generate(&paths.identity_key()) {
         Ok(k) => k,
@@ -1438,6 +1566,26 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
     let email = email_link::EmailShared::load(&paths.data_dir);
     let (email_link, email_link_inbox) = email_link::EmailLink::new();
 
+    // OAuth grants: flows wait in memory for the callback coord
+    // relays; agent-managed grants persist in the data directory.
+    let oauth_broker_url = oauth_broker_url();
+    let oauth_grants = {
+        let broker = match p2claw_agent::oauth_grants::BrokerClient::new(
+            &oauth_broker_url,
+            Arc::clone(&identity),
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                error!(error = %e, url = %oauth_broker_url, "invalid OAuth broker URL");
+                return ExitCode::from(2);
+            }
+        };
+        let store = p2claw_agent::oauth_grants::GrantStore::load_or_empty(
+            paths.data_dir.join("oauth-grants.json"),
+        );
+        Arc::new(p2claw_agent::oauth_grants::OauthGrants::new(broker, store))
+    };
+
     // `GET /v1/status` inputs. `process_start` powers uptime;
     // `coord_state_since` tracks when the coord-health value last
     // changed (a lightweight watcher stamps it), so status can report
@@ -1485,6 +1633,7 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
         Arc::clone(&peer_proxy_source),
         email.clone(),
         email_link.clone(),
+        Arc::clone(&oauth_grants),
     ));
 
     // Construct the OAuth validator. Built unconditionally
@@ -1495,12 +1644,8 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
     // overridable via env for self-hosters / tests; defaults to
     // the canonical `oauth::DEFAULT_BROKER_URL`.
     let oauth_validator = {
-        let broker_url = std::env::var("P2CLAW_AGENT_OAUTH_BROKER_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| p2claw_agent::oauth::DEFAULT_BROKER_URL.to_string());
         let cfg = p2claw_agent::oauth::OAuthConfig {
-            broker_url,
+            broker_url: oauth_broker_url,
             expected_aud_z32: identity.peer_id().to_z32(),
         };
         let v = std::sync::Arc::new(p2claw_agent::oauth::OAuthValidator::new(cfg));
@@ -2018,6 +2163,7 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
         let endpoint = iroh_endpoint.clone();
         let coord_health = coord_health_tx.clone();
         let email = email.clone();
+        let oauth_grants = Arc::clone(&oauth_grants);
         async move {
             coord_conn::run(
                 coord_url,
@@ -2034,6 +2180,7 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
                 announcer_inbox,
                 email,
                 email_link_inbox,
+                oauth_grants,
                 coord_health,
             )
             .await

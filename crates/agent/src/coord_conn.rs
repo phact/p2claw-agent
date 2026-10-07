@@ -49,6 +49,7 @@ use crate::route_announcer::{AnnounceAck, AnnounceJob, AnnouncerInbox};
 use crate::signal_handler::{OutboundSignal, SignalRegistry};
 use crate::state_store::{self, AgentState};
 use p2claw_agent::email::{drain, EmailStream, Inbox};
+use p2claw_agent::oauth_grants::OauthGrants;
 use p2claw_agent::routes::{RouteRecord, RouteTable};
 
 /// Build the `route_announce` payload from a route-table snapshot.
@@ -199,6 +200,7 @@ pub async fn run(
     mut announcer_inbox: AnnouncerInbox,
     email: EmailShared,
     mut email_inbox: EmailLinkInbox,
+    oauth_grants: Arc<OauthGrants>,
     // Sender for `CoordHealth`; receiver lives on the post-upgrade
     // watchdog (or is dropped if no watchdog is running).
     coord_health: watch::Sender<CoordHealth>,
@@ -280,6 +282,7 @@ pub async fn run(
                 &mut announcer_inbox,
                 &email,
                 &mut email_inbox,
+                &oauth_grants,
                 &identity,
                 &coord_health,
             ) => res,
@@ -475,6 +478,7 @@ async fn session(
     announcer_inbox: &mut AnnouncerInbox,
     email: &EmailShared,
     email_inbox: &mut EmailLinkInbox,
+    oauth_grants: &OauthGrants,
     identity: &Arc<SigningKey>,
     coord_health: &watch::Sender<CoordHealth>,
 ) -> Result<SessionEnd, SessionError> {
@@ -816,8 +820,15 @@ async fn session(
                         debug!(count, "coord_conn: email_pending");
                         drain_notify.notify_one();
                     }
-                    Message::OauthGrantCallback { flow_id, .. } => {
-                        debug!(%flow_id, "coord_conn: oauth grant callback ignored (not supported yet)");
+                    Message::OauthGrantCallback { flow_id, code, error, state } => {
+                        // Only the flow id is logged: the code is
+                        // single-use and useless without the verifier,
+                        // but it still doesn't belong in a log.
+                        if oauth_grants.flows().deliver(&flow_id, code, error, state) {
+                            debug!(%flow_id, "coord_conn: oauth_grant_callback delivered");
+                        } else {
+                            debug!(%flow_id, "coord_conn: oauth_grant_callback for an unknown, expired or consumed flow; dropped");
+                        }
                     }
                     Message::Hello { .. }
                     | Message::AddrsUpdate { .. }
