@@ -138,6 +138,16 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Look up another machine by alias (or peer id): its peer id,
+    /// asked of coordination. Exits 1 if coordination doesn't know it.
+    /// Talks to the running agent's local API.
+    Peer {
+        /// Alias (e.g. `devout-chamois-2124`) or z-base-32 peer id.
+        name: String,
+        /// Emit the raw JSON from the local API.
+        #[arg(long)]
+        json: bool,
+    },
     /// List the active visitor sessions — transport path and age.
     /// Talks to the running agent's local API over a Unix-domain
     /// socket.
@@ -570,9 +580,9 @@ enum AppsCmd {
         /// Private app name (as registered with `apps expose
         /// --private`).
         name: String,
-        /// Peer id (z-base-32) to share with. Repeat for multiple
-        /// peers. Find a machine's peer id by running `p2claw identity`
-        /// on it.
+        /// Peer id (z-base-32) or alias to share with; an alias is
+        /// looked up with coordination and the share keeps its peer id.
+        /// Repeat for multiple peers.
         #[arg(long = "with", value_name = "PEER", required = true)]
         with: Vec<String>,
     },
@@ -771,6 +781,7 @@ fn main() -> ExitCode {
             Cmd::Identity => cmd_identity(&paths).await,
             Cmd::Status { json } => cli_client::cmd_status(json).await,
             Cmd::Sessions { json } => cli_client::cmd_sessions(json).await,
+            Cmd::Peer { name, json } => cli_client::cmd_peer(name, json).await,
             Cmd::Register => cmd_register(&paths, &coord_url, &cli.coord_domain).await,
             Cmd::Run => cmd_run(&paths, &coord_url, &cli.coord_domain).await,
             // Flat `unexpose` / `routes` were dropped; both now

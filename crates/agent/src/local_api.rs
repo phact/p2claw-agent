@@ -390,6 +390,18 @@ async fn dispatch(api: Arc<LocalApi>, req: Request<Incoming>) -> Response<ApiBod
             if path.starts_with("/v1/proxy/") {
                 return proxy_handler(&api, req).await;
             }
+            if let Some(name) = path.strip_prefix("/v1/peers/") {
+                if method != Method::GET {
+                    return json_response(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        &ErrorBody {
+                            error: "method_not_allowed",
+                            detail: None,
+                        },
+                    );
+                }
+                return peer_handler(&api, name).await;
+            }
             if path == "/v1/email" || path.starts_with("/v1/email/") {
                 return email::dispatch(&api, req, &method, &path).await;
             }
@@ -818,6 +830,75 @@ async fn put_shares_handler(api: &LocalApi, req: Request<Incoming>) -> Response<
                 detail: Some(e.to_string()),
             },
         ),
+    }
+}
+
+/// Wire shape of `GET /v1/peers/<alias or peer id>`.
+#[derive(Serialize)]
+struct PeerBody {
+    peer_id: String,
+    alias: Option<String>,
+}
+
+/// `GET /v1/peers/<alias or peer id>`: whether coord knows the peer,
+/// and its peer id (what shares are keyed on). Asked the way a dial
+/// asks (`/v1/connect`, native, no app), so it answers for boxes that
+/// are offline too, and opens no session. 404 `no_such_peer`, 410
+/// `revoked`.
+async fn peer_handler(api: &LocalApi, name: &str) -> Response<ApiBody> {
+    let is_peer_id = p2claw_identity::PeerId::from_z32(name).is_ok();
+    if !is_peer_id && !p2claw_identity::alias_label::is_valid_alias_label(name) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &ErrorBody {
+                error: "bad_peer",
+                detail: Some(format!(
+                    "`{name}` is neither a z-base-32 peer id nor a valid alias"
+                )),
+            },
+        );
+    }
+    let Some(cache) = api.peer_proxy.get().cloned() else {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &ErrorBody {
+                error: "resolver_unavailable",
+                detail: Some("peer dialer not ready".into()),
+            },
+        );
+    };
+    let opts = cache.options();
+    let coord = opts
+        .coord_url
+        .clone()
+        .unwrap_or_else(|| p2claw_iroh_client::connect::default_coord_url(&opts.parent_domain));
+    match p2claw_iroh_client::connect::connect(&coord, name, None, opts.timeout).await {
+        Ok(found) => json_response(
+            StatusCode::OK,
+            &PeerBody {
+                peer_id: found.peer_id,
+                alias: (!is_peer_id).then(|| name.to_string()),
+            },
+        ),
+        Err(e) => {
+            let (status, error) = match e {
+                p2claw_iroh_client::PeerClientError::NoSuchPeer => {
+                    (StatusCode::NOT_FOUND, "no_such_peer")
+                }
+                p2claw_iroh_client::PeerClientError::PeerRevoked => (StatusCode::GONE, "revoked"),
+                p2claw_iroh_client::PeerClientError::RateLimited(_) => {
+                    (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+                }
+                _ => (StatusCode::BAD_GATEWAY, "coord_error"),
+            };
+            json_response(
+                status,
+                &ErrorBody {
+                    error,
+                    detail: Some(e.to_string()),
+                },
+            )
+        }
     }
 }
 
@@ -2500,6 +2581,85 @@ mod tests {
             assert!(
                 text.contains("\"stage\":\"resolve\""),
                 "coord-unreachable must map to the resolve stage:\n{text}"
+            );
+        })
+        .await;
+    }
+
+    /// `/v1/peers/<name>` asks coord (`/v1/connect`, native) for the
+    /// peer id behind an alias; one coord doesn't know is a 404, and
+    /// garbage never reaches coord.
+    #[tokio::test]
+    async fn peers_endpoint_looks_up_aliases_with_coord() {
+        let known = SigningKey::generate().peer_id().to_z32();
+        let coord = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coord_url = format!("http://{}", coord.local_addr().unwrap());
+        let known_cl = known.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = coord.accept().await else {
+                    return;
+                };
+                let known = known_cl.clone();
+                tokio::spawn(async move {
+                    let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let known = known.clone();
+                        async move {
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
+                            let asked: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            let (status, out) = if asked["alias"] == "devout-chamois-2124" {
+                                assert_eq!(asked["visitor_kind"], "native");
+                                assert!(asked.get("app").is_none(), "no app: no app gate");
+                                (
+                                    200,
+                                    serde_json::json!({"peer_id": known, "iroh_node_id": known}),
+                                )
+                            } else {
+                                (404, serde_json::json!({"error": "no_such_peer"}))
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(Bytes::from(out.to_string())))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+        with_server(|sock, api| async move {
+            let opts = p2claw_iroh_client::ClientOptions {
+                parent_domain: "p2claw.com".into(),
+                coord_url: Some(coord_url),
+                timeout: Duration::from_secs(5),
+                endpoint: None,
+                relay_url: None,
+            };
+            let _ = api.peer_proxy.set(Arc::new(PeerClientCache::new(opts)));
+            let get = |path: &str| {
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            };
+
+            let text = http_over_uds(&sock, get("/v1/peers/devout-chamois-2124").as_bytes()).await;
+            assert!(text.contains("200"), "{text}");
+            assert!(text.contains(&format!("\"peer_id\":\"{known}\"")), "{text}");
+            assert!(text.contains("\"alias\":\"devout-chamois-2124\""), "{text}");
+
+            let text = http_over_uds(&sock, get("/v1/peers/wise-toad-8257").as_bytes()).await;
+            assert!(
+                text.contains("404") && text.contains("\"no_such_peer\""),
+                "{text}"
+            );
+
+            let text = http_over_uds(&sock, get("/v1/peers/Not_An_Alias").as_bytes()).await;
+            assert!(
+                text.contains("400") && text.contains("\"bad_peer\""),
+                "{text}"
             );
         })
         .await;

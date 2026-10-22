@@ -356,11 +356,82 @@ pub async fn cmd_expose(
 
 /// `p2claw apps share <name> --with <peer>...` → merge the peers
 /// into the app's share row via GET + PUT `/v1/shares`.
+/// Wire shape of `GET /v1/peers/<name>`.
+#[derive(Deserialize)]
+struct PeerBody {
+    peer_id: String,
+    alias: Option<String>,
+}
+
+/// A peer id for `name` (a peer id or an alias), from the agent's
+/// `/v1/peers/` lookup; on failure the error is printed and the
+/// exit code returned.
+async fn lookup_peer(sock: &Path, name: &str) -> Result<PeerBody, ExitCode> {
+    let path = format!("/v1/peers/{name}");
+    let (status, bytes) = match uds_request(sock, Method::GET, &path, None).await {
+        Ok(v) => v,
+        Err(e) => return Err(fail(&e)),
+    };
+    if status != StatusCode::OK {
+        print_server_error(status, &bytes);
+        return Err(ExitCode::from(if status == StatusCode::NOT_FOUND {
+            1
+        } else {
+            2
+        }));
+    }
+    serde_json::from_slice(&bytes).map_err(|e| {
+        eprintln!("error: agent returned unexpected JSON: {e}");
+        ExitCode::from(2)
+    })
+}
+
+/// `p2claw peer <name>` → the peer id behind an alias (or a peer id
+/// coordination knows).
+pub async fn cmd_peer(name: String, json: bool) -> ExitCode {
+    let sock = match resolve_sock() {
+        Ok(p) => p,
+        Err(e) => return fail(&e),
+    };
+    let found = match lookup_peer(&sock, &name).await {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"peer_id": found.peer_id, "alias": found.alias})
+        );
+    } else {
+        println!("peer_id: {}", found.peer_id);
+        if let Some(alias) = found.alias {
+            println!("alias:   {alias}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 pub async fn cmd_share(name: String, with: Vec<String>) -> ExitCode {
     let sock = match resolve_sock() {
         Ok(p) => p,
         Err(e) => return fail(&e),
     };
+    // Aliases become peer ids first: shares are kept by peer id.
+    let mut peers = Vec::with_capacity(with.len());
+    for w in with {
+        if p2claw_identity::PeerId::from_z32(&w).is_ok() {
+            peers.push(w);
+            continue;
+        }
+        match lookup_peer(&sock, &w).await {
+            Ok(found) => {
+                println!("{w} is {}", found.peer_id);
+                peers.push(found.peer_id);
+            }
+            Err(code) => return code,
+        }
+    }
+    let with = peers;
     let mut body = match fetch_shares(&sock).await {
         Ok(b) => b,
         Err(code) => return code,
