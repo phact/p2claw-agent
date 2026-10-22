@@ -6,8 +6,8 @@
 //!
 //! ## Fetch path
 //!
-//! Everything stays on GitHub. Four URLs, all CDN-served, no API
-//! rate limit, no signing key, no edge route, no coord endpoint:
+//! Everything stays on GitHub. Five URLs, all CDN-served, no API
+//! rate limit, no edge route, no coord endpoint:
 //!
 //! 1. `GET https://github.com/<repo>/releases/latest`
 //!    → 302 → `Location: https://github.com/<repo>/releases/tag/v<version>`.
@@ -15,7 +15,8 @@
 //!    segment, strip leading `v`).
 //! 2. `GET https://github.com/<repo>/releases/download/v<version>/SHA256SUMS`
 //!    → text body of `<hex-sha256>  <filename>` lines (one per
-//!    asset). Parse into a `HashMap<String, [u8; 32]>`.
+//!    asset), and `…/SHA256SUMS.sig` next to it. Check the signature,
+//!    then parse into a `HashMap<String, [u8; 32]>`.
 //! 3. Pick our platform's tarball filename
 //!    (`p2claw-v<version>-<os>-<arch>.tar.gz`); look up its
 //!    expected SHA-256 in the SHA256SUMS map.
@@ -39,10 +40,14 @@
 //!
 //! ## Integrity
 //!
-//! SHA-256 from SHA256SUMS is the only integrity check; the trust
-//! root is GitHub-the-host (the CDN serves SHA256SUMS and the
-//! tarball over the same TLS chain). It protects against transit
-//! corruption and a compromised CDN edge.
+//! `SHA256SUMS.sig` is a raw Ed25519 signature over
+//! [`RELEASE_SIGNATURE_DOMAIN`] followed by the SHA256SUMS bytes, made
+//! with the release key whose public half is [`release_pubkey`]. The
+//! key is held offline and the signature is added after the release
+//! workflow publishes, so neither GitHub nor anyone who can impersonate
+//! it can ship a binary: a release without a valid signature is never
+//! installed. The tarball's SHA-256 is then checked against the signed
+//! list.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -66,6 +71,46 @@ const PREVIOUS_RELEASE_REPO: &str = "phact/p2claw-skill";
 
 /// Env-var name for the OSS-fork override.
 pub const RELEASE_REPO_ENV: &str = "P2CLAW_RELEASE_REPO";
+
+/// Prefix of the signed message: the signature covers this followed by
+/// the exact SHA256SUMS bytes.
+pub const RELEASE_SIGNATURE_DOMAIN: &[u8] = b"p2claw-release-v1\n";
+
+/// Public half of the release signing key, base64url without padding.
+/// Forks that publish their own releases set `P2CLAW_RELEASE_PUBKEY` at
+/// build time, alongside [`RELEASE_REPO_ENV`].
+const RELEASE_PUBKEY_B64URL: &str = match option_env!("P2CLAW_RELEASE_PUBKEY") {
+    Some(s) => s,
+    None => "NS2LhB49a-zuhGR10sOGn6kmSZ9486KxAw0Gb4jaBAE",
+};
+
+/// The key release signatures must verify against.
+pub fn release_pubkey() -> [u8; 32] {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(RELEASE_PUBKEY_B64URL)
+        .ok()
+        .and_then(|v| v.try_into().ok())
+        .expect("release public key is 32 bytes of base64url")
+}
+
+/// Check `sig` (raw 64 bytes) over a release's SHA256SUMS `body`.
+pub fn verify_release_signature(
+    pubkey: &[u8; 32],
+    body: &[u8],
+    sig: &[u8],
+) -> Result<(), AutoUpgradeError> {
+    use ed25519_dalek::Verifier as _;
+    let key = ed25519_dalek::VerifyingKey::from_bytes(pubkey)
+        .map_err(|_| AutoUpgradeError::BadSignature)?;
+    let sig =
+        ed25519_dalek::Signature::from_slice(sig).map_err(|_| AutoUpgradeError::BadSignature)?;
+    let mut msg = Vec::with_capacity(RELEASE_SIGNATURE_DOMAIN.len() + body.len());
+    msg.extend_from_slice(RELEASE_SIGNATURE_DOMAIN);
+    msg.extend_from_slice(body);
+    key.verify(&msg, &sig)
+        .map_err(|_| AutoUpgradeError::BadSignature)
+}
 
 /// Build the latest-release redirect URL for `<org>/<repo>`.
 /// HTTP GET against this URL returns a 302 with
@@ -141,6 +186,8 @@ pub enum AutoUpgradeError {
     Sha256SumsParse(String),
     #[error("SHA256SUMS has no entry for asset `{0}`")]
     Sha256SumsNoEntry(String),
+    #[error("SHA256SUMS.sig does not verify against the release key")]
+    BadSignature,
     #[error("running platform (os={os}, arch={arch}) is not in the release matrix")]
     UnsupportedPlatform {
         os: &'static str,
@@ -229,18 +276,31 @@ pub async fn fetch_latest_release(repo: &str) -> Result<LatestRelease, AutoUpgra
         .timeout(FETCH_TIMEOUT)
         .build()
         .map_err(AutoUpgradeError::Http)?;
-    let sha256sums_url = release_asset_url(repo, &version, "SHA256SUMS");
-    let sha256sums_body = client
-        .get(&sha256sums_url)
-        .send()
-        .await
-        .map_err(AutoUpgradeError::Http)?
-        .error_for_status()
-        .map_err(AutoUpgradeError::Http)?
-        .text()
-        .await
-        .map_err(AutoUpgradeError::Http)?;
-    let sums = parse_sha256sums(&sha256sums_body)?;
+    let fetch = |asset: &'static str| {
+        let url = release_asset_url(repo, &version, asset);
+        let client = client.clone();
+        async move {
+            client
+                .get(&url)
+                .send()
+                .await
+                .map_err(AutoUpgradeError::Http)?
+                .error_for_status()
+                .map_err(AutoUpgradeError::Http)?
+                .bytes()
+                .await
+                .map_err(AutoUpgradeError::Http)
+        }
+    };
+    let sha256sums_body = fetch("SHA256SUMS").await?;
+    // A release is only trusted once its SHA256SUMS is signed; until
+    // then (or if the signature is missing or wrong) skip it and retry
+    // next cycle.
+    let sig = fetch("SHA256SUMS.sig").await?;
+    verify_release_signature(&release_pubkey(), &sha256sums_body, &sig)?;
+    let sha256sums_body = std::str::from_utf8(&sha256sums_body)
+        .map_err(|_| AutoUpgradeError::Sha256SumsParse("not UTF-8".into()))?;
+    let sums = parse_sha256sums(sha256sums_body)?;
 
     // Step 3: Resolve our platform asset filename + look it up.
     let asset = current_platform_asset(&version).ok_or(AutoUpgradeError::UnsupportedPlatform {
@@ -374,9 +434,7 @@ pub enum BinaryError {
 }
 
 /// Verify a downloaded asset's bytes match the expected SHA-256
-/// from the SHA256SUMS file. The only integrity check; trust root
-/// is GitHub-the-host (the CDN that served SHA256SUMS + the tarball
-/// over the same TLS chain).
+/// from the signed SHA256SUMS file.
 ///
 /// Pure on `(asset_bytes, expected_digest)`; testable in
 /// isolation.
@@ -1440,6 +1498,47 @@ mod tests {
     }
 
     // ---------- URL builders + repo override ------------------
+
+    fn sign_release(sk: &ed25519_dalek::SigningKey, body: &[u8]) -> Vec<u8> {
+        use ed25519_dalek::Signer as _;
+        let mut msg = RELEASE_SIGNATURE_DOMAIN.to_vec();
+        msg.extend_from_slice(body);
+        sk.sign(&msg).to_bytes().to_vec()
+    }
+
+    #[test]
+    fn release_signature_round_trips() {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let body = b"abc  p2claw-v1.0.0-linux-x86_64.tar.gz\n";
+        let sig = sign_release(&sk, body);
+        verify_release_signature(&sk.verifying_key().to_bytes(), body, &sig).unwrap();
+    }
+
+    #[test]
+    fn release_signature_rejects_tampering_and_other_keys() {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key().to_bytes();
+        let body = b"abc  p2claw-v1.0.0-linux-x86_64.tar.gz\n";
+        let sig = sign_release(&sk, body);
+        assert!(
+            verify_release_signature(&pk, b"abd  p2claw-v1.0.0-linux-x86_64.tar.gz\n", &sig)
+                .is_err()
+        );
+        let other = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        assert!(verify_release_signature(&other.verifying_key().to_bytes(), body, &sig).is_err());
+        assert!(verify_release_signature(&pk, body, &sig[..63]).is_err());
+        // The domain prefix is part of what's signed.
+        use ed25519_dalek::Signer as _;
+        let bare = sk.sign(body).to_bytes();
+        assert!(verify_release_signature(&pk, body, &bare).is_err());
+    }
+
+    #[test]
+    fn built_in_release_key_decodes() {
+        if option_env!("P2CLAW_RELEASE_PUBKEY").is_none() {
+            assert!(ed25519_dalek::VerifyingKey::from_bytes(&release_pubkey()).is_ok());
+        }
+    }
 
     #[test]
     fn latest_release_url_for_default_repo() {
