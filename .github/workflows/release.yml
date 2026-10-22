@@ -69,6 +69,13 @@ jobs:
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             asset: linux-aarch64
+          # For an app that bundles the agent (a tablet as a box); built with
+          # the NDK against API 30. Not installable on its own, and it doesn't
+          # upgrade itself: the app ships new ones.
+          - os: ubuntu-22.04
+            target: aarch64-linux-android
+            asset: android-aarch64
+            android: true
     runs-on: ${{ matrix.os }}
     env:
       ASSET: p2claw-${{ needs.resolve.outputs.tag }}-${{ matrix.asset }}.tar.gz
@@ -80,6 +87,17 @@ jobs:
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           rustup target add ${{ matrix.target }}
+
+      - uses: nttld/setup-ndk@v1
+        if: ${{ matrix.android }}
+        id: setup-ndk
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: install cargo-ndk
+        if: ${{ matrix.android }}
+        run: cargo install cargo-ndk --locked
 
       - uses: actions/cache@v5
         with:
@@ -95,7 +113,19 @@ jobs:
             ${{ matrix.asset }}-${{ matrix.os }}-cargo-
 
       - name: build
+        if: ${{ !matrix.android }}
         run: cargo build --release -p p2claw-agent --target ${{ matrix.target }}
+
+      # Stripped: it rides inside an app.
+      - name: build (android)
+        if: ${{ matrix.android }}
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -eu
+          cargo ndk -t arm64-v8a -P 30 build --release -p p2claw-agent --bin p2claw
+          "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" \
+            "target/${{ matrix.target }}/release/p2claw"
 
       - name: package
         shell: bash
@@ -128,6 +158,7 @@ jobs:
       # Runs the binary and the service install path end to end without
       # starting the agent, so CI never registers throwaway machines.
       - name: smoke test
+        if: ${{ !matrix.android }}
         shell: bash
         run: |
           set -eu
@@ -137,6 +168,17 @@ jobs:
           "$SMOKE/p2claw" --version
           "$SMOKE/p2claw" service install --bin-path "$SMOKE/p2claw" --no-start
           "$SMOKE/p2claw" service uninstall
+
+      # Can't run here: check it's an Android arm64 executable.
+      - name: smoke test (android)
+        if: ${{ matrix.android }}
+        shell: bash
+        run: |
+          set -eu
+          INFO="$(file "target/${{ matrix.target }}/release/p2claw")"
+          echo "$INFO"
+          echo "$INFO" | grep -q "ARM aarch64"
+          echo "$INFO" | grep -q "/system/bin/linker64"
 
       - uses: actions/upload-artifact@v5
         with:
