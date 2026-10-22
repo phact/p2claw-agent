@@ -13,9 +13,10 @@
 //!   - iroh: the remote address of the connection's selected path;
 //!   - edge (the public HTTPS tunnel, an iroh peer coord names in
 //!     `hello_ack`): the visitor address the edge passes along. The
-//!     edge's front proxy sets `X-Forwarded-For` from the TCP
-//!     connection, so the agent keeps the last entry of the edge's
-//!     value; anything to its left came from the visitor.
+//!     edge sets `X-Forwarded-For` itself, one entry, from the TCP
+//!     connection or the hop its trusted proxy added; the agent
+//!     keeps the last entry, so an older edge that appended to the
+//!     visitor's value still can't be fooled.
 //! - When the path is relayed (TURN, or the iroh relay) the address
 //!   the agent sees is the relay's, not the visitor's. Rather than
 //!   pass that off as the visitor, `X-Forwarded-For` is left out and
@@ -128,8 +129,8 @@ impl RemoteSource for SharedRemote {
 
 /// z-base-32 peer ids of the operator's edge, as coord lists them in
 /// `hello_ack`. An iroh connection from one of these carries traffic
-/// for many visitors, and its `X-Forwarded-For` is the edge's front
-/// proxy speaking, so it is kept rather than replaced. Empty until
+/// for many visitors, and its `X-Forwarded-For` is the edge speaking
+/// (it replaces the visitor's), so it is kept rather than replaced. Empty until
 /// the first `hello_ack` (and with a coord that doesn't list them):
 /// the edge is then treated like any other iroh peer.
 #[derive(Debug, Clone, Default)]
@@ -184,7 +185,7 @@ pub fn set_forwarded_for(headers: &mut Vec<(Bytes, Bytes)>, remote: Remote, from
 
 /// The last entry of the request's `X-Forwarded-For` (across repeated
 /// header lines), if it is an IP address: the hop closest to the
-/// agent, the only one the edge's front proxy vouches for.
+/// agent, the only one the edge vouches for.
 fn last_forwarded_for(headers: &[(Bytes, Bytes)]) -> Option<IpAddr> {
     let value = headers
         .iter()
