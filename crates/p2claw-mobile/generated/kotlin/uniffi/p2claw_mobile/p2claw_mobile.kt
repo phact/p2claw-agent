@@ -751,6 +751,8 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_p2claw_mobile_checksum_method_signalingsession_session_id(
     ): Int
+    external fun uniffi_p2claw_mobile_checksum_method_signalingsession_verify_offer(
+    ): Int
     external fun uniffi_p2claw_mobile_checksum_method_signalingtransport_post_connect(
     ): Int
     external fun uniffi_p2claw_mobile_checksum_method_signalingtransport_open_ws(
@@ -859,6 +861,8 @@ external fun uniffi_p2claw_mobile_fn_method_signalingsession_send_payload(`ptr`:
 ): Long
 external fun uniffi_p2claw_mobile_fn_method_signalingsession_session_id(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
+external fun uniffi_p2claw_mobile_fn_method_signalingsession_verify_offer(`ptr`: Long,`sdp`: RustBuffer.ByValue,`dtlsFpSigB64`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): Unit
 external fun uniffi_p2claw_mobile_fn_clone_signalingtransport(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
 ): Long
 external fun uniffi_p2claw_mobile_fn_free_signalingtransport(`handle`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -1103,6 +1107,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_p2claw_mobile_checksum_method_signalingsession_session_id() != 26554) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_p2claw_mobile_checksum_method_signalingsession_verify_offer() != 54010) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_p2claw_mobile_checksum_method_signalingtransport_post_connect() != 24365) {
@@ -2758,6 +2765,14 @@ public interface SignalingSessionInterface {
     
     fun `sessionId`(): kotlin.String
     
+    /**
+     * Check a remote SDP from the box before applying it: it must
+     * carry one SHA-256 fingerprint, signed (`dtls_fp_sig_b64`) by the
+     * box this session verified, for this session. Call before
+     * `setRemoteDescription`; on error, close the session.
+     */
+    fun `verifyOffer`(`sdp`: kotlin.String, `dtlsFpSigB64`: kotlin.String?)
+    
     companion object
 }
 
@@ -2988,6 +3003,25 @@ open class SignalingSession: Disposable, AutoCloseable, SignalingSessionInterfac
     }
     )
     }
+    
+
+    
+    /**
+     * Check a remote SDP from the box before applying it: it must
+     * carry one SHA-256 fingerprint, signed (`dtls_fp_sig_b64`) by the
+     * box this session verified, for this session. Call before
+     * `setRemoteDescription`; on error, close the session.
+     */
+    @Throws(SignalingException::class)override fun `verifyOffer`(`sdp`: kotlin.String, `dtlsFpSigB64`: kotlin.String?)
+        = 
+    callWithHandle {
+    uniffiRustCallWithError(SignalingException) { _status ->
+    UniffiLib.uniffi_p2claw_mobile_fn_method_signalingsession_verify_offer(
+        it,
+        FfiConverterString.lower(`sdp`),FfiConverterOptionalString.lower(`dtlsFpSigB64`),_status)
+}
+    }
+    
     
 
     
@@ -4640,6 +4674,13 @@ data class SignalingConfig (
      * signature. Empty for unauthenticated boxes.
      */
     var `authHeaders`: List<StringPair>
+    , 
+    /**
+     * Root key of the coordination service (z-base-32), which signs
+     * the alias binding in its answer. `None` uses the built-in key
+     * for `https://coord.p2claw.com` and fails for any other URL.
+     */
+    var `coordRoot`: kotlin.String? = null 
     
 ){
     
@@ -4660,6 +4701,7 @@ public object FfiConverterTypeSignalingConfig: FfiConverterRustBuffer<SignalingC
             FfiConverterString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterSequenceTypeStringPair.read(buf),
+            FfiConverterOptionalString.read(buf),
         )
     }
 
@@ -4667,7 +4709,8 @@ public object FfiConverterTypeSignalingConfig: FfiConverterRustBuffer<SignalingC
             FfiConverterString.allocationSize(value.`coordUrl`) +
             FfiConverterString.allocationSize(value.`alias`) +
             FfiConverterOptionalString.allocationSize(value.`app`) +
-            FfiConverterSequenceTypeStringPair.allocationSize(value.`authHeaders`)
+            FfiConverterSequenceTypeStringPair.allocationSize(value.`authHeaders`) +
+            FfiConverterOptionalString.allocationSize(value.`coordRoot`)
     )
 
     override fun write(value: SignalingConfig, buf: ByteBuffer) {
@@ -4675,6 +4718,7 @@ public object FfiConverterTypeSignalingConfig: FfiConverterRustBuffer<SignalingC
             FfiConverterString.write(value.`alias`, buf)
             FfiConverterOptionalString.write(value.`app`, buf)
             FfiConverterSequenceTypeStringPair.write(value.`authHeaders`, buf)
+            FfiConverterOptionalString.write(value.`coordRoot`, buf)
     }
 }
 
@@ -5791,6 +5835,18 @@ sealed class SignalingException: kotlin.Exception() {
             get() = ""
     }
     
+    /**
+     * Coordination's answer or the box's offer failed verification,
+     * so the peer can't be trusted to be the box that owns the alias.
+     */
+    class Untrusted(
+        
+        val v1: kotlin.String
+        ) : SignalingException() {
+        override val message
+            get() = "v1=${ v1 }"
+    }
+    
 
     
 
@@ -5820,6 +5876,9 @@ public object FfiConverterTypeSignalingError : FfiConverterRustBuffer<SignalingE
                 FfiConverterString.read(buf),
                 )
             4 -> SignalingException.SessionEnded()
+            5 -> SignalingException.Untrusted(
+                FfiConverterString.read(buf),
+                )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -5845,6 +5904,11 @@ public object FfiConverterTypeSignalingError : FfiConverterRustBuffer<SignalingE
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
                 4UL
             )
+            is SignalingException.Untrusted -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterString.allocationSize(value.v1)
+            )
         }
     }
 
@@ -5867,6 +5931,11 @@ public object FfiConverterTypeSignalingError : FfiConverterRustBuffer<SignalingE
             }
             is SignalingException.SessionEnded -> {
                 buf.putInt(4)
+                Unit
+            }
+            is SignalingException.Untrusted -> {
+                buf.putInt(5)
+                FfiConverterString.write(value.v1, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

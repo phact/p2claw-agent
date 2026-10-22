@@ -28,8 +28,11 @@
 use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use p2claw_identity::PeerId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::verify;
 
 /// One header pair carried on signaling HTTPS / WS requests. Distinct
 /// from [`crate::codec::Header`] (which holds raw bytes for wire
@@ -73,6 +76,11 @@ pub struct SignalingConfig {
     /// cert plus a per-request `X-P2claw-Device-Sig` timestamp
     /// signature. Empty for unauthenticated boxes.
     pub auth_headers: Vec<StringPair>,
+    /// Root key of the coordination service (z-base-32), which signs
+    /// the alias binding in its answer. `None` uses the built-in key
+    /// for `https://coord.p2claw.com` and fails for any other URL.
+    #[uniffi(default = None)]
+    pub coord_root: Option<String>,
 }
 
 /// Errors raised by the signaling client and session.
@@ -102,6 +110,10 @@ pub enum SignalingError {
     /// Session ended before the operation could complete.
     #[error("session ended")]
     SessionEnded,
+    /// Coordination's answer or the box's offer failed verification,
+    /// so the peer can't be trusted to be the box that owns the alias.
+    #[error("untrusted: {0}")]
+    Untrusted(String),
 }
 
 impl From<serde_json::Error> for SignalingError {
@@ -249,9 +261,23 @@ struct RawConnectResponse {
     ice_servers: Vec<serde_json::Value>,
     #[serde(default)]
     turn_expires_at: u64,
+    #[serde(default)]
+    alias: Option<String>,
+    #[serde(default)]
+    binding_sig_b64url: Option<String>,
+    #[serde(default)]
+    binding_issued_at: Option<u64>,
 }
 
 impl RawConnectResponse {
+    fn binding(&self) -> verify::Binding {
+        verify::Binding {
+            alias: self.alias.clone(),
+            sig_b64url: self.binding_sig_b64url.clone(),
+            issued_at: self.binding_issued_at,
+        }
+    }
+
     fn into_public(self) -> BrowserConnectResponse {
         BrowserConnectResponse {
             session_id: self.session_id,
@@ -297,6 +323,8 @@ impl SignalingClient {
         &self,
         config: SignalingConfig,
     ) -> Result<Arc<SignalingSession>, SignalingError> {
+        let root = verify::coord_root(&config.coord_url, config.coord_root.as_deref())
+            .map_err(SignalingError::Untrusted)?;
         let connect_url = format!("{}/v1/connect", config.coord_url.trim_end_matches('/'));
         let req = ConnectRequest {
             alias: &config.alias,
@@ -308,8 +336,10 @@ impl SignalingClient {
         headers.push(StringPair::new("content-type", "application/json"));
 
         let response_bytes = self.http.post_connect(connect_url, body, headers).await?;
-        let parsed: BrowserConnectResponse =
-            serde_json::from_slice::<RawConnectResponse>(&response_bytes)?.into_public();
+        let raw = serde_json::from_slice::<RawConnectResponse>(&response_bytes)?;
+        let peer = verify::check_resolution(&root, &config.alias, &raw.peer_id, &raw.binding())
+            .map_err(SignalingError::Untrusted)?;
+        let parsed: BrowserConnectResponse = raw.into_public();
 
         let conn_id = self
             .http
@@ -348,6 +378,7 @@ impl SignalingClient {
         Ok(Arc::new(SignalingSession {
             session_id: parsed.session_id,
             peer_id: parsed.peer_id,
+            peer,
             ice_servers: parsed.ice_servers,
             heartbeat_interval_s: heartbeat_s,
             conn_id,
@@ -368,6 +399,8 @@ struct SessionInner {
 pub struct SignalingSession {
     pub session_id: String,
     pub peer_id: String,
+    /// `peer_id`, verified against the alias binding at connect.
+    peer: PeerId,
     pub ice_servers: Vec<String>,
     pub heartbeat_interval_s: u32,
     conn_id: u64,
@@ -402,6 +435,24 @@ impl SignalingSession {
     }
     pub fn heartbeat_interval_s(&self) -> u32 {
         self.heartbeat_interval_s
+    }
+
+    /// Check a remote SDP from the box before applying it: it must
+    /// carry one SHA-256 fingerprint, signed (`dtls_fp_sig_b64`) by the
+    /// box this session verified, for this session. Call before
+    /// `setRemoteDescription`; on error, close the session.
+    pub fn verify_offer(
+        &self,
+        sdp: String,
+        dtls_fp_sig_b64: Option<String>,
+    ) -> Result<(), SignalingError> {
+        verify::check_offer(
+            &self.peer,
+            &self.session_id,
+            &sdp,
+            dtls_fp_sig_b64.as_deref(),
+        )
+        .map_err(SignalingError::Untrusted)
     }
 
     /// Send a relay payload up to coord. The bytes are wrapped in a
@@ -572,45 +623,83 @@ mod tests {
         SignalingClient::new(http, ws)
     }
 
-    fn connect_response() -> &'static str {
-        r#"{
-            "session_id":"01HXXFAKE",
-            "peer_id":"abcdef",
-            "signal_url":"wss://coord.p2claw.com/v1/signal/01HXXFAKE",
-            "signal_token":"tok-1",
-            "ice_servers":[],
-            "turn_expires_at":1750000000
-        }"#
+    const ALIAS: &str = "blue-otter-7392";
+
+    /// A coordination root key and a box, with a `/v1/connect` answer
+    /// binding [`ALIAS`] to the box.
+    struct Fixture {
+        root: p2claw_identity::SigningKey,
+        box_sk: p2claw_identity::SigningKey,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                root: p2claw_identity::SigningKey::generate(),
+                box_sk: p2claw_identity::SigningKey::generate(),
+            }
+        }
+
+        fn connect_response(&self) -> String {
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            let peer = self.box_sk.peer_id();
+            let sig = p2claw_identity::sign_alias_binding(&self.root, ALIAS, &peer, 1_700_000_000)
+                .unwrap();
+            serde_json::json!({
+                "session_id": "01HXXFAKE",
+                "peer_id": peer.to_z32(),
+                "signal_url": "wss://coord.p2claw.com/v1/signal/01HXXFAKE",
+                "signal_token": "tok-1",
+                "ice_servers": [],
+                "turn_expires_at": 1750000000,
+                "alias": ALIAS,
+                "alias_kind": "haiku",
+                "binding_sig_b64url": URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+                "binding_issued_at": 1_700_000_000u64,
+            })
+            .to_string()
+        }
+
+        fn config(&self) -> SignalingConfig {
+            SignalingConfig {
+                coord_url: "https://coord.example.net".into(),
+                alias: ALIAS.into(),
+                app: None,
+                auth_headers: Vec::new(),
+                coord_root: Some(self.root.peer_id().to_z32()),
+            }
+        }
+    }
+
+    fn handshake_script() -> Vec<MockWsStep> {
+        vec![
+            MockWsStep::ExpectSend(r#"{"type":"auth","v":1,"signal_token":"tok-1"}"#),
+            MockWsStep::Deliver(r#"{"type":"auth_ack","v":1,"heartbeat_interval_s":15}"#),
+        ]
     }
 
     #[tokio::test]
     async fn handshake_authenticates_and_returns_session() {
+        let f = Fixture::new();
         let transport = MockTransport::new(
-            connect_response(),
+            &f.connect_response(),
             vec![
                 MockWsStep::ExpectSend(r#"{"type":"auth","v":1,"signal_token":"tok-1"}"#),
                 MockWsStep::Deliver(r#"{"type":"auth_ack","v":1,"heartbeat_interval_s":15}"#),
             ],
         );
         let client = build_client(transport);
-        let session = client
-            .connect(SignalingConfig {
-                coord_url: "https://coord.p2claw.com".into(),
-                alias: "blue-otter-7392".into(),
-                app: None,
-                auth_headers: Vec::new(),
-            })
-            .await
-            .expect("handshake ok");
+        let session = client.connect(f.config()).await.expect("handshake ok");
         assert_eq!(session.session_id, "01HXXFAKE");
-        assert_eq!(session.peer_id, "abcdef");
+        assert_eq!(session.peer_id, f.box_sk.peer_id().to_z32());
         assert_eq!(session.heartbeat_interval_s, 15);
     }
 
     #[tokio::test]
     async fn handshake_propagates_coord_error_envelope() {
+        let f = Fixture::new();
         let transport = MockTransport::new(
-            connect_response(),
+            &f.connect_response(),
             vec![
                 MockWsStep::ExpectSend(r#"{"type":"auth","v":1,"signal_token":"tok-1"}"#),
                 MockWsStep::Deliver(
@@ -619,21 +708,15 @@ mod tests {
             ],
         );
         let client = build_client(transport);
-        let result = client
-            .connect(SignalingConfig {
-                coord_url: "https://coord.p2claw.com".into(),
-                alias: "x".into(),
-                app: None,
-                auth_headers: Vec::new(),
-            })
-            .await;
+        let result = client.connect(f.config()).await;
         assert!(matches!(result, Err(SignalingError::Rejected(_))));
     }
 
     #[tokio::test]
     async fn relay_round_trip_through_session() {
+        let f = Fixture::new();
         let transport = MockTransport::new(
-            connect_response(),
+            &f.connect_response(),
             vec![
                 MockWsStep::ExpectSend(r#"{"type":"auth","v":1,"signal_token":"tok-1"}"#),
                 MockWsStep::Deliver(r#"{"type":"auth_ack","v":1,"heartbeat_interval_s":15}"#),
@@ -647,15 +730,7 @@ mod tests {
             ],
         );
         let client = build_client(transport);
-        let session = client
-            .connect(SignalingConfig {
-                coord_url: "https://coord.p2claw.com".into(),
-                alias: "x".into(),
-                app: None,
-                auth_headers: Vec::new(),
-            })
-            .await
-            .expect("handshake");
+        let session = client.connect(f.config()).await.expect("handshake");
 
         session
             .send_payload(b"hello".to_vec())
@@ -676,8 +751,9 @@ mod tests {
 
     #[tokio::test]
     async fn close_after_eof_yields_none() {
+        let f = Fixture::new();
         let transport = MockTransport::new(
-            connect_response(),
+            &f.connect_response(),
             vec![
                 MockWsStep::ExpectSend(r#"{"type":"auth","v":1,"signal_token":"tok-1"}"#),
                 MockWsStep::Deliver(r#"{"type":"auth_ack","v":1,"heartbeat_interval_s":15}"#),
@@ -685,16 +761,74 @@ mod tests {
             ],
         );
         let client = build_client(transport);
-        let session = client
-            .connect(SignalingConfig {
-                coord_url: "https://coord.p2claw.com".into(),
-                alias: "x".into(),
-                app: None,
-                auth_headers: Vec::new(),
-            })
+        let session = client.connect(f.config()).await.expect("handshake");
+        assert!(session.next_event().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_refuses_an_answer_the_root_did_not_sign() {
+        let f = Fixture::new();
+        let impostor = Fixture::new();
+        let transport = MockTransport::new(&impostor.connect_response(), handshake_script());
+        let result = build_client(transport).connect(f.config()).await;
+        assert!(
+            matches!(result, Err(SignalingError::Untrusted(_))),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_needs_a_root_key_for_other_coordination_services() {
+        let f = Fixture::new();
+        let transport = MockTransport::new(&f.connect_response(), handshake_script());
+        let mut config = f.config();
+        config.coord_root = None;
+        let result = build_client(transport).connect(config).await;
+        assert!(
+            matches!(result, Err(SignalingError::Untrusted(_))),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn session_verifies_the_box_offer() {
+        use base64::engine::general_purpose::STANDARD;
+        let f = Fixture::new();
+        let transport = MockTransport::new(&f.connect_response(), handshake_script());
+        let session = build_client(transport)
+            .connect(f.config())
             .await
             .expect("handshake");
-        assert!(session.next_event().await.is_none());
+
+        let fp = [0xABu8; 32];
+        let hex = fp
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let sdp = format!("v=0\r\na=fingerprint:sha-256 {hex}\r\n");
+        let sign = |sk: &p2claw_identity::SigningKey| {
+            STANDARD.encode(
+                p2claw_identity::sign_dtls_fp(sk, "01HXXFAKE", 0x01, &fp)
+                    .unwrap()
+                    .to_bytes(),
+            )
+        };
+
+        session
+            .verify_offer(sdp.clone(), Some(sign(&f.box_sk)))
+            .expect("box's own offer");
+        let other = p2claw_identity::SigningKey::generate();
+        assert!(matches!(
+            session.verify_offer(sdp.clone(), Some(sign(&other))),
+            Err(SignalingError::Untrusted(_))
+        ));
+        assert!(matches!(
+            session.verify_offer(sdp, None),
+            Err(SignalingError::Untrusted(_))
+        ));
     }
 
     #[test]

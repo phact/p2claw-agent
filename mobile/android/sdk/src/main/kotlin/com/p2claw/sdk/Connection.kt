@@ -17,7 +17,9 @@ import org.webrtc.RtpReceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import uniffi.p2claw_mobile.Decoder
+import uniffi.p2claw_mobile.EndReason
 import uniffi.p2claw_mobile.SignalingEvent
+import uniffi.p2claw_mobile.SignalingException
 import uniffi.p2claw_mobile.SignalingSession
 import uniffi.p2claw_mobile.encodeFrame
 import java.nio.ByteBuffer
@@ -268,8 +270,20 @@ class Connection internal constructor(
                         is SignalingEvent.Payload -> {
                             val preview = String(event.bytes, Charsets.UTF_8).take(160)
                             android.util.Log.i(TAG, "signal[$idx] payload ${event.bytes.size}B: $preview")
-                            runCatching { handleSignalPayload(peer, session, sigState, event.bytes) }
-                                .onFailure { android.util.Log.w(TAG, "signal[$idx] handle threw: ${it.message}") }
+                            val failure = runCatching {
+                                handleSignalPayload(peer, session, sigState, event.bytes)
+                            }.exceptionOrNull()
+                            if (failure is SignalingException.Untrusted) {
+                                // Not the box that owns the alias: give up
+                                // on the session rather than talk to it.
+                                android.util.Log.w(TAG, "signal[$idx] refused: ${failure.message}")
+                                dcOpened.completeExceptionally(failure)
+                                runCatching { session.end(EndReason.ABORTED) }
+                                return@launch
+                            }
+                            if (failure != null) {
+                                android.util.Log.w(TAG, "signal[$idx] handle threw: ${failure.message}")
+                            }
                         }
                         is SignalingEvent.Error -> {
                             android.util.Log.w(TAG, "signal[$idx] error -> break")
@@ -283,7 +297,13 @@ class Connection internal constructor(
                 }
             }
 
-            val dc = dcOpened.await()
+            val dc = try {
+                dcOpened.await()
+            } catch (e: Throwable) {
+                peer.dispose()
+                dispatchScope.cancel()
+                throw e
+            }
             android.util.Log.i(TAG, "data channel opened-callback: label=${dc.label()} id=${dc.id()} state=${dc.state()}")
             val dcReady = CompletableDeferred<Unit>()
             dc.registerObserver(object : DataChannel.Observer {
@@ -332,6 +352,9 @@ class Connection internal constructor(
             when (val kind = json.optString("kind")) {
                 "offer" -> {
                     val sdp = json.getString("sdp")
+                    // The box signs its DTLS fingerprint for this
+                    // session; anything else isn't the box.
+                    session.verifyOffer(sdp, json.optString("dtls_fp_sig_b64").ifEmpty { null })
                     android.util.Log.i(TAG, "applying offer (${sdp.length}B)")
                     setRemote(peer, SessionDescription(SessionDescription.Type.OFFER, sdp))
                     val answer = createAnswer(peer)
@@ -354,6 +377,7 @@ class Connection internal constructor(
                     // Defensive: in case the box rerole-flips, accept
                     // an answer too. Not expected on the current wire.
                     val sdp = json.getString("sdp")
+                    session.verifyOffer(sdp, json.optString("dtls_fp_sig_b64").ifEmpty { null })
                     android.util.Log.i(TAG, "applying answer (${sdp.length}B)")
                     setRemote(peer, SessionDescription(SessionDescription.Type.ANSWER, sdp))
                     val drained = state.markRemoteSetAndDrain()

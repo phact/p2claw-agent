@@ -43,6 +43,17 @@ final class PeerConnectionBridge: NSObject, LKRTCPeerConnectionDelegate, @unchec
     /// opens on its side. The SDK is the answerer; we don't create
     /// the DC locally — it arrives via `didOpen`.
     var dataChannelContinuation: CheckedContinuation<LKRTCDataChannel, Error>?
+    /// Why the handshake was abandoned, if it was. Pending and later
+    /// waits fail with it.
+    private(set) var failure: Error?
+
+    func fail(_ error: Error) {
+        failure = error
+        connectedContinuation?.resume(throwing: error)
+        connectedContinuation = nil
+        dataChannelContinuation?.resume(throwing: error)
+        dataChannelContinuation = nil
+    }
 
     func peerConnection(_ pc: LKRTCPeerConnection, didChange newState: LKRTCPeerConnectionState) {
         switch newState {

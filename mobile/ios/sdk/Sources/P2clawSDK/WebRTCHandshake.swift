@@ -24,6 +24,13 @@ enum WebRTCHandshake {
         let kind: String
         var sdp: String?
         var candidate: CandidatePayload?
+        /// The box's signature over its DTLS fingerprint for this session.
+        var dtlsFpSigB64: String? = nil
+
+        enum CodingKeys: String, CodingKey {
+            case kind, sdp, candidate
+            case dtlsFpSigB64 = "dtls_fp_sig_b64"
+        }
     }
 
     /// Nested ICE-candidate payload inside the envelope.
@@ -79,7 +86,14 @@ enum WebRTCHandshake {
         // `.failed` state rejects our continuations, so failure still
         // propagates.
         let pumpTask = Task<Void, Error> {
-            try await pumpSignalingInbound(session: session, pc: pc)
+            do {
+                try await pumpSignalingInbound(session: session, pc: pc)
+            } catch {
+                // A refused offer never reaches the peer connection, so
+                // nothing else would end the waits below.
+                bridge.fail(error)
+                throw error
+            }
         }
         do {
             async let dataChannel = waitForDataChannel(bridge: bridge)
@@ -100,12 +114,20 @@ enum WebRTCHandshake {
 
     private static func waitForConnected(bridge: PeerConnectionBridge) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            if let err = bridge.failure {
+                cont.resume(throwing: err)
+                return
+            }
             bridge.connectedContinuation = cont
         }
     }
 
     private static func waitForDataChannel(bridge: PeerConnectionBridge) async throws -> LKRTCDataChannel {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<LKRTCDataChannel, Error>) in
+            if let err = bridge.failure {
+                cont.resume(throwing: err)
+                return
+            }
             bridge.dataChannelContinuation = cont
         }
     }
@@ -126,6 +148,13 @@ enum WebRTCHandshake {
                 switch env.kind {
                 case "offer":
                     guard let sdp = env.sdp else { continue }
+                    // The box signs its DTLS fingerprint for this
+                    // session; anything else isn't the box.
+                    do {
+                        try session.verifyOffer(sdp: sdp, dtlsFpSigB64: env.dtlsFpSigB64)
+                    } catch let err as SignalingError {
+                        throw P2clawError.from(err)
+                    }
                     let offer = LKRTCSessionDescription(type: .offer, sdp: sdp)
                     try await setRemote(pc: pc, sdp: offer)
                     remoteSet = true

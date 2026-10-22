@@ -26,6 +26,7 @@ class P2clawClient private constructor(
     private val appContext: Context,
     private val coordUrl: String,
     private val parentDomain: String,
+    private val coordRoot: String?,
     private val factory: PeerConnectionFactory,
     internal val http: OkHttpClient,
 ) {
@@ -65,6 +66,7 @@ class P2clawClient private constructor(
             alias = request.alias,
             app = request.app,
             authHeaders = request.authHeaders.map { (n, v) -> StringPair(n, v) },
+            coordRoot = coordRoot,
         )
         val session = signaling.connect(cfg)
         // Host the box's WsForwarder expects for app/alias routing —
@@ -97,11 +99,16 @@ class P2clawClient private constructor(
          * @param appContext application context (needed for
          *   libwebrtc's `PeerConnectionFactory.InitializationOptions`).
          * @param coordUrl coord origin (e.g. `https://coord.p2claw.com`).
+         * @param coordRoot root key (z-base-32) of the coordination
+         *   service at [coordUrl], which signs its alias bindings.
+         *   Leave null for `https://coord.p2claw.com`, whose key is
+         *   built in; required for any other coordination service.
          */
         fun create(
             appContext: Context,
             coordUrl: String,
             parentDomain: String = "p2claw.com",
+            coordRoot: String? = null,
         ): P2clawClient {
             PeerConnectionFactory.initialize(
                 PeerConnectionFactory.InitializationOptions.builder(appContext)
@@ -114,7 +121,7 @@ class P2clawClient private constructor(
                 .readTimeout(0, TimeUnit.SECONDS) // signaling WS may sit idle for minutes
                 .pingInterval(25, TimeUnit.SECONDS)
                 .build()
-            return P2clawClient(appContext, coordUrl, parentDomain, factory, http)
+            return P2clawClient(appContext, coordUrl, parentDomain, coordRoot, factory, http)
         }
     }
 }

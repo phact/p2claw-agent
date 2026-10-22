@@ -1151,6 +1151,14 @@ public protocol SignalingSessionProtocol: AnyObject, Sendable {
     
     func sessionId()  -> String
     
+    /**
+     * Check a remote SDP from the box before applying it: it must
+     * carry one SHA-256 fingerprint, signed (`dtls_fp_sig_b64`) by the
+     * box this session verified, for this session. Call before
+     * `setRemoteDescription`; on error, close the session.
+     */
+    func verifyOffer(sdp: String, dtlsFpSigB64: String?) throws 
+    
 }
 /**
  * One authenticated signaling session. The held WS connection is
@@ -1304,6 +1312,21 @@ open func sessionId() -> String  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Check a remote SDP from the box before applying it: it must
+     * carry one SHA-256 fingerprint, signed (`dtls_fp_sig_b64`) by the
+     * box this session verified, for this session. Call before
+     * `setRemoteDescription`; on error, close the session.
+     */
+open func verifyOffer(sdp: String, dtlsFpSigB64: String?)throws   {try rustCallWithError(FfiConverterTypeSignalingError_lift) {
+    uniffi_p2claw_mobile_fn_method_signalingsession_verify_offer(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(sdp),
+        FfiConverterOptionString.lower(dtlsFpSigB64),$0
+    )
+}
 }
     
 
@@ -2667,6 +2690,12 @@ public struct SignalingConfig: Equatable, Hashable {
      * signature. Empty for unauthenticated boxes.
      */
     public var authHeaders: [StringPair]
+    /**
+     * Root key of the coordination service (z-base-32), which signs
+     * the alias binding in its answer. `None` uses the built-in key
+     * for `https://coord.p2claw.com` and fails for any other URL.
+     */
+    public var coordRoot: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2685,11 +2714,17 @@ public struct SignalingConfig: Equatable, Hashable {
          * Typical values: an `Authorization` bearer of the device-binding
          * cert plus a per-request `X-P2claw-Device-Sig` timestamp
          * signature. Empty for unauthenticated boxes.
-         */authHeaders: [StringPair]) {
+         */authHeaders: [StringPair], 
+        /**
+         * Root key of the coordination service (z-base-32), which signs
+         * the alias binding in its answer. `None` uses the built-in key
+         * for `https://coord.p2claw.com` and fails for any other URL.
+         */coordRoot: String? = nil) {
         self.coordUrl = coordUrl
         self.alias = alias
         self.app = app
         self.authHeaders = authHeaders
+        self.coordRoot = coordRoot
     }
 
     
@@ -2711,7 +2746,8 @@ public struct FfiConverterTypeSignalingConfig: FfiConverterRustBuffer {
                 coordUrl: FfiConverterString.read(from: &buf), 
                 alias: FfiConverterString.read(from: &buf), 
                 app: FfiConverterOptionString.read(from: &buf), 
-                authHeaders: FfiConverterSequenceTypeStringPair.read(from: &buf)
+                authHeaders: FfiConverterSequenceTypeStringPair.read(from: &buf), 
+                coordRoot: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -2720,6 +2756,7 @@ public struct FfiConverterTypeSignalingConfig: FfiConverterRustBuffer {
         FfiConverterString.write(value.alias, into: &buf)
         FfiConverterOptionString.write(value.app, into: &buf)
         FfiConverterSequenceTypeStringPair.write(value.authHeaders, into: &buf)
+        FfiConverterOptionString.write(value.coordRoot, into: &buf)
     }
 }
 
@@ -3793,6 +3830,12 @@ public enum SignalingError: Swift.Error, Equatable, Hashable, Foundation.Localiz
      * Session ended before the operation could complete.
      */
     case SessionEnded
+    /**
+     * Coordination's answer or the box's offer failed verification,
+     * so the peer can't be trusted to be the box that owns the alias.
+     */
+    case Untrusted(String
+    )
 
     
 
@@ -3832,6 +3875,9 @@ public struct FfiConverterTypeSignalingError: FfiConverterRustBuffer {
             try FfiConverterString.read(from: &buf)
             )
         case 4: return .SessionEnded
+        case 5: return .Untrusted(
+            try FfiConverterString.read(from: &buf)
+            )
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -3862,6 +3908,11 @@ public struct FfiConverterTypeSignalingError: FfiConverterRustBuffer {
         case .SessionEnded:
             writeInt(&buf, Int32(4))
         
+        
+        case let .Untrusted(v1):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(v1, into: &buf)
+            
         }
     }
 }
@@ -4725,6 +4776,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_p2claw_mobile_checksum_method_signalingsession_session_id() != 26554) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_p2claw_mobile_checksum_method_signalingsession_verify_offer() != 54010) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_p2claw_mobile_checksum_method_signalingtransport_post_connect() != 24365) {

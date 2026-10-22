@@ -39,6 +39,7 @@ pub mod codec;
 pub mod device;
 pub mod fetch;
 pub mod signaling;
+pub mod verify;
 pub mod ws;
 
 pub use device::{

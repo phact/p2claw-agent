@@ -26,6 +26,11 @@ public final class P2clawClient: @unchecked Sendable {
     /// Auth headers attached to `POST /v1/connect`. Typical values
     /// are the device-binding cert bearer + a per-request signature.
     public let authHeaders: [String: String]
+    /// Root key (z-base-32) of the coordination service at `coordUrl`,
+    /// which signs its alias bindings. `nil` for
+    /// `https://coord.p2claw.com`, whose key is built in; required for
+    /// any other coordination service.
+    public let coordRoot: String?
 
     private let factory: LKRTCPeerConnectionFactory
     private let signalingBackend: URLSessionSignalingBackend
@@ -34,12 +39,14 @@ public final class P2clawClient: @unchecked Sendable {
         coordUrl: String,
         stunServers: [String] = [],
         turnServers: [TurnServer] = [],
-        authHeaders: [String: String] = [:]
+        authHeaders: [String: String] = [:],
+        coordRoot: String? = nil
     ) {
         self.coordUrl = coordUrl
         self.stunServers = stunServers
         self.turnServers = turnServers
         self.authHeaders = authHeaders
+        self.coordRoot = coordRoot
 
         // LKRTCInitializeSSL must run once per process; WebRTC asserts
         // on duplicate calls. The framework's
@@ -75,7 +82,8 @@ public final class P2clawClient: @unchecked Sendable {
                     coordUrl: coordUrl,
                     alias: address.alias,
                     app: address.app,
-                    authHeaders: authHeaders.map { StringPair(name: $0.key, value: $0.value) }
+                    authHeaders: authHeaders.map { StringPair(name: $0.key, value: $0.value) },
+                    coordRoot: coordRoot
                 )
             )
         } catch let err as SignalingError {
