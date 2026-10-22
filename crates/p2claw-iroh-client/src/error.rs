@@ -18,6 +18,17 @@ pub enum PeerClientError {
     #[error("coordination: no such peer")]
     NoSuchPeer,
 
+    /// Coordination's answer for the target isn't signed by the
+    /// trusted root key, so the peer it names can't be trusted.
+    #[error("coordination: untrusted answer: {0}")]
+    UntrustedResolution(String),
+
+    /// No coordination root key to check answers against: the
+    /// coordination service isn't the default and
+    /// `ClientOptions::coord_root` is unset.
+    #[error("no coordination root key configured for {0}")]
+    NoCoordRoot(String),
+
     #[error("coordination: peer revoked")]
     PeerRevoked,
 

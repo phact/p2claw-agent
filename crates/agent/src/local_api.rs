@@ -2652,6 +2652,7 @@ mod tests {
                 timeout: Duration::from_secs(2),
                 endpoint: None,
                 relay_url: None,
+                coord_root: Some(SigningKey::generate().peer_id()),
             };
             let _ = api
                 .peer_proxy
@@ -2725,6 +2726,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 endpoint: None,
                 relay_url: None,
+                coord_root: Some(SigningKey::generate().peer_id()),
             };
             let _ = api.peer_proxy.set(Arc::new(PeerClientCache::new(opts)));
             let get = |path: &str| {
@@ -2853,10 +2855,24 @@ mod tests {
         // ---- Coord stub: /v1/connect resolves the far side --------
         let coord = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let coord_url = format!("http://{}", coord.local_addr().unwrap());
+        use base64::Engine as _;
+        let coord_root = SigningKey::generate();
+        let remote_peer = p2claw_identity::PeerId::from_z32(&remote_z32).unwrap();
+        let binding_sig = p2claw_identity::sign_alias_binding(
+            &coord_root,
+            REMOTE_ALIAS,
+            &remote_peer,
+            1_700_000_000,
+        )
+        .unwrap();
         let connect_body = serde_json::json!({
             "peer_id": remote_z32,
             "iroh_node_id": remote_z32,
             "iroh_direct_addrs": [format!("127.0.0.1:{remote_port}")],
+            "alias": REMOTE_ALIAS,
+            "binding_sig_b64url": base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(binding_sig.to_bytes()),
+            "binding_issued_at": 1_700_000_000u64,
         })
         .to_string();
         tokio::spawn(async move {
@@ -2901,6 +2917,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             endpoint: Some(caller_endpoint.clone()),
             relay_url: None,
+            coord_root: Some(coord_root.peer_id()),
         };
         let _ = api.peer_proxy.set(Arc::new(PeerClientCache::new(opts)));
 

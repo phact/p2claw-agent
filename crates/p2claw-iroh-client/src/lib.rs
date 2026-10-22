@@ -175,6 +175,11 @@ pub struct ClientOptions {
     /// `endpoint` is supplied (the caller is responsible for the
     /// pre-built endpoint's relay config).
     pub relay_url: Option<String>,
+    /// Root key of the coordination service, which signs the alias
+    /// bindings in its answers. `None` uses the built-in key when the
+    /// coordination URL is the default `https://coord.p2claw.com`, and
+    /// fails for any other.
+    pub coord_root: Option<PeerId>,
 }
 
 impl Default for ClientOptions {
@@ -185,6 +190,7 @@ impl Default for ClientOptions {
             timeout: Duration::from_secs(30),
             endpoint: None,
             relay_url: None,
+            coord_root: None,
         }
     }
 }
@@ -221,6 +227,13 @@ impl PeerClient {
             .coord_url
             .clone()
             .unwrap_or_else(|| connect::default_coord_url(&opts.parent_domain));
+        let coord_root = match opts.coord_root {
+            Some(k) => k,
+            None if coord_url == connect::default_coord_url(DEFAULT_PARENT_DOMAIN) => {
+                p2claw_identity::p2claw_coord_root()
+            }
+            None => return Err(PeerClientError::NoCoordRoot(coord_url)),
+        };
 
         let timeout = opts.timeout;
         let resp = tokio::time::timeout(
@@ -239,12 +252,9 @@ impl PeerClient {
 
         tracing::debug!(peer = %resp.peer_id, "coord resolved peer_id");
 
-        // No client-side prefix-binding check: the haiku alias
-        // carries no cryptographic content. Iroh's QUIC handshake
-        // authenticates the remote NodeId via its TLS cert, so the
-        // dial below fails if coord handed us a mismatched peer_id.
-        let peer_id = PeerId::from_z32(&resp.peer_id)
-            .map_err(|e| PeerClientError::Coord(format!("invalid peer_id: {e}")))?;
+        // Iroh's handshake authenticates whatever node id we dial, so
+        // the node id itself must be one the root key vouches for.
+        let peer_id = connect::verify_response(&coord_root, &parsed.alias_label, &resp)?;
 
         let endpoint_addr = transport::endpoint_addr_from_response(&resp)?;
         let endpoint = match opts.endpoint {

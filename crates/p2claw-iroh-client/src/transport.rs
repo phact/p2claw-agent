@@ -146,6 +146,7 @@ mod tests {
             iroh_node_id: id,
             iroh_relay_url: None,
             iroh_direct_addrs: Vec::new(),
+            ..Default::default()
         };
         let err = endpoint_addr_from_response(&resp).unwrap_err();
         match err {
@@ -165,6 +166,7 @@ mod tests {
                 "198.51.100.7:54321".to_string(),
                 "[2001:db8::1]:54321".to_string(),
             ],
+            ..Default::default()
         };
         let addr = endpoint_addr_from_response(&resp).unwrap();
         assert_eq!(addr.addrs.len(), 3);
@@ -178,6 +180,7 @@ mod tests {
             iroh_node_id: id,
             iroh_relay_url: None,
             iroh_direct_addrs: vec!["not-an-addr".to_string()],
+            ..Default::default()
         };
         let err = endpoint_addr_from_response(&resp).unwrap_err();
         assert!(matches!(err, PeerClientError::Iroh(_)));

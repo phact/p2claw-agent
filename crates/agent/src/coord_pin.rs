@@ -16,13 +16,15 @@ use p2claw_identity::PeerId;
 /// Coordination FQDN the compiled-in root key belongs to.
 pub const DEFAULT_COORD_DOMAIN: &str = "coord.p2claw.com";
 
-/// Root key of [`DEFAULT_COORD_DOMAIN`], base64url without padding.
-/// Forks pointing the default at their own coordination service set
-/// `P2CLAW_DEFAULT_COORD_ROOT_PUBKEY` at build time.
-pub const DEFAULT_COORD_ROOT_PUBKEY: &str = match option_env!("P2CLAW_DEFAULT_COORD_ROOT_PUBKEY") {
-    Some(s) => s,
-    None => "SS7zAo5r6_W2IOX1WMpt0Y6hhMdxgDZKsWrhHQoCCTg",
-};
+/// Root key of [`DEFAULT_COORD_DOMAIN`]. Forks pointing the default at
+/// their own coordination service set `P2CLAW_DEFAULT_COORD_ROOT_PUBKEY`
+/// (base64url) at build time.
+pub fn default_root() -> Result<PeerId, String> {
+    match option_env!("P2CLAW_DEFAULT_COORD_ROOT_PUBKEY") {
+        Some(b64) => decode(b64),
+        None => Ok(p2claw_identity::p2claw_coord_root()),
+    }
+}
 
 /// Decode a base64url (no padding) 32-byte root key.
 pub fn decode(b64: &str) -> Result<PeerId, String> {
@@ -40,7 +42,7 @@ pub fn decode(b64: &str) -> Result<PeerId, String> {
 pub fn pinned(coord_domain: &str, configured: Option<&str>) -> Result<Option<PeerId>, String> {
     match configured.filter(|s| !s.is_empty()) {
         Some(b64) => decode(b64).map(Some),
-        None if coord_domain == DEFAULT_COORD_DOMAIN => decode(DEFAULT_COORD_ROOT_PUBKEY).map(Some),
+        None if coord_domain == DEFAULT_COORD_DOMAIN => default_root().map(Some),
         None => Ok(None),
     }
 }
@@ -59,7 +61,15 @@ mod tests {
     #[test]
     fn default_domain_pins_compiled_in_key() {
         let pin = pinned(DEFAULT_COORD_DOMAIN, None).unwrap();
-        assert_eq!(pin, Some(decode(DEFAULT_COORD_ROOT_PUBKEY).unwrap()));
+        assert_eq!(pin, Some(default_root().unwrap()));
+    }
+
+    #[test]
+    fn built_in_key_is_the_production_root() {
+        if option_env!("P2CLAW_DEFAULT_COORD_ROOT_PUBKEY").is_none() {
+            let b64 = B64_URL.encode(default_root().unwrap().as_bytes());
+            assert_eq!(b64, "SS7zAo5r6_W2IOX1WMpt0Y6hhMdxgDZKsWrhHQoCCTg");
+        }
     }
 
     #[test]

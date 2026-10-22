@@ -77,6 +77,7 @@ use hyper::body::{Frame as HyperFrame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
+use p2claw_identity::PeerId;
 use p2claw_iroh_client::url::P2clawHost;
 use p2claw_iroh_client::{ClientOptions, PeerClient, PeerClientError, Request as PeerRequest};
 use tokio::net::TcpStream;
@@ -210,8 +211,15 @@ impl PeerDialer {
     /// deployments where the operator's
     /// coord isn't at `coord.<parent>` (or the parent domain
     /// itself isn't in real DNS yet). `cmd_run` threads
-    /// `state.coord_url` through here.
-    pub fn new(ca: LocalCa, parent_domain: impl Into<String>, coord_url: Option<String>) -> Self {
+    /// `state.coord_url` through here. `coord_root` is the root key
+    /// coordination's answers must be signed with; `cmd_run` passes
+    /// the pinned key from `agent.state`.
+    pub fn new(
+        ca: LocalCa,
+        parent_domain: impl Into<String>,
+        coord_url: Option<String>,
+        coord_root: Option<PeerId>,
+    ) -> Self {
         let opts_template = ClientOptions {
             parent_domain: parent_domain.into(),
             coord_url,
@@ -222,6 +230,7 @@ impl PeerDialer {
             // `endpoint: Some(_)` later. So `relay_url` here is
             // irrelevant, but the field is required.
             relay_url: None,
+            coord_root,
         };
         // Surface the constructed opts at info so an operator can
         // verify post-init that the threaded values landed; this
@@ -557,6 +566,7 @@ mod tests {
             ca.clone(),
             "p2claw.com",
             Some("http://coord:8081".to_string()),
+            None,
         );
         assert_eq!(
             with_override.inner.cache.options().coord_url.as_deref(),
@@ -564,7 +574,7 @@ mod tests {
             "explicit coord_url must reach the opts_template iroh-client clones per dial"
         );
 
-        let without_override = PeerDialer::new(ca, "p2claw.com", None);
+        let without_override = PeerDialer::new(ca, "p2claw.com", None, None);
         assert!(
             without_override.inner.cache.options().coord_url.is_none(),
             "None preserves the production-default behavior \
@@ -581,7 +591,7 @@ mod tests {
         // is the path under test (matches the production posture
         // for the dispatcher-correctness tests below; the e2e
         // harness exercises the override path explicitly).
-        let dialer = PeerDialer::new(ca, "p2claw.com", None);
+        let dialer = PeerDialer::new(ca, "p2claw.com", None, None);
         (dialer, dir)
     }
 

@@ -8,6 +8,7 @@ mod error;
 mod keypair;
 mod peer_id;
 mod proofs;
+mod resolution;
 mod zbase32;
 
 pub use alias_label::{
@@ -27,5 +28,8 @@ pub use proofs::{
     BOX_REQUEST_MAX_SKEW_SECS, BOX_REQUEST_PEER_HEADER, BOX_REQUEST_SIGNATURE_HEADER,
     BOX_REQUEST_TIMESTAMP_HEADER, DTLS_FP_DOMAIN_SEP, REGISTRATION_DOMAIN_SEP,
     REGISTRATION_MAX_SKEW_SECS,
+};
+pub use resolution::{
+    p2claw_coord_root, verify_alias_resolution, AliasBindingRef, P2CLAW_COORD_ROOT_PEER_ID,
 };
 pub use zbase32::{decode as zbase32_decode, encode as zbase32_encode, Z32_ALPHABET};

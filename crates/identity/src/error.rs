@@ -34,4 +34,10 @@ pub enum IdentityError {
 
     #[error("alias too long (>65535 bytes)")]
     AliasTooLong,
+
+    #[error("coordination resolved the target to a different peer")]
+    ResolutionMismatch,
+
+    #[error("coordination sent no alias binding")]
+    MissingBinding,
 }

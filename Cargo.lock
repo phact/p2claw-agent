@@ -3128,6 +3128,7 @@ dependencies = [
 name = "p2claw-iroh-client"
 version = "0.0.0"
 dependencies = [
+ "base64",
  "bytes",
  "futures-util",
  "iroh",

@@ -17,6 +17,7 @@ p2claw-wire = { path = "../wire" }
 p2claw-identity = { path = "../identity" }
 p2claw-translator = { path = "../translator" }
 
+base64 = "0.22"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 iroh = "1"

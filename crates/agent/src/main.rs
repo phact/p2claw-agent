@@ -1865,6 +1865,7 @@ async fn cmd_run(
             timeout: std::time::Duration::from_secs(30),
             endpoint: Some(iroh_endpoint.clone()),
             relay_url: None,
+            coord_root: Some(state.coord_root_pubkey),
         };
         let _ = peer_proxy_source.set(Arc::new(p2claw_agent::peer_dialer::PeerClientCache::new(
             proxy_opts,
@@ -2174,6 +2175,7 @@ async fn cmd_run(
         // `P2CLAW_COORD_URL` lands here so the client doesn't
         // reach for the synthetic `https://coord.<parent>/`.
         let coord_url_for_dialer = coord_url.to_string();
+        let coord_root = state.coord_root_pubkey;
         // Hand the pre-bound listener to the supervised
         // accept task. Arc-shared so supervisor's panic-restart
         // re-enters with the same FD (the listener was bound
@@ -2192,6 +2194,7 @@ async fn cmd_run(
                     ca.clone(),
                     parent.clone(),
                     Some(coord_url),
+                    Some(coord_root),
                 ));
                 if let Err(e) =
                     sni_listener::serve_with_listener(listener, &parent, dialer, sd).await

@@ -4,6 +4,9 @@
 
 use std::time::Duration;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use p2claw_identity::{verify_alias_resolution, AliasBindingRef, PeerId};
 use serde::{Deserialize, Serialize};
 
 use crate::error::PeerClientError;
@@ -24,7 +27,7 @@ pub struct ConnectRequest<'a> {
 }
 
 /// The native-kind response from `POST /v1/connect`.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct NativeConnectResponse {
     /// Box's canonical peer_id (z-base-32).
     pub peer_id: String,
@@ -37,6 +40,52 @@ pub struct NativeConnectResponse {
     /// Direct UDP socket addresses from the box's latest `addrs_update`.
     #[serde(default)]
     pub iroh_direct_addrs: Vec<String>,
+    /// Alias the binding covers. Absent when the target was a peer id.
+    #[serde(default)]
+    pub alias: Option<String>,
+    /// Root-key signature binding `alias` to `peer_id`, base64url.
+    #[serde(default)]
+    pub binding_sig_b64url: Option<String>,
+    #[serde(default)]
+    pub binding_issued_at: Option<u64>,
+}
+
+/// Accept `resp` as coord's answer for `target` only if `root` signed
+/// it (see [`p2claw_identity::verify_alias_resolution`]) and the node to
+/// dial is the bound peer.
+pub fn verify_response(
+    root: &PeerId,
+    target: &str,
+    resp: &NativeConnectResponse,
+) -> Result<PeerId, PeerClientError> {
+    let peer_id = PeerId::from_z32(&resp.peer_id)
+        .map_err(|e| PeerClientError::Coord(format!("invalid peer_id: {e}")))?;
+    if resp.iroh_node_id != resp.peer_id {
+        return Err(PeerClientError::UntrustedResolution(
+            "iroh_node_id differs from peer_id".into(),
+        ));
+    }
+    let sig = match resp.binding_sig_b64url.as_deref() {
+        Some(b64) => Some(URL_SAFE_NO_PAD.decode(b64).map_err(|_| {
+            PeerClientError::UntrustedResolution("binding signature is not base64url".into())
+        })?),
+        None => None,
+    };
+    let binding = match (
+        resp.alias.as_deref(),
+        resp.binding_issued_at,
+        sig.as_deref(),
+    ) {
+        (Some(alias), Some(issued_at), Some(sig)) => Some(AliasBindingRef {
+            alias,
+            issued_at,
+            sig,
+        }),
+        _ => None,
+    };
+    verify_alias_resolution(root, target, &peer_id, binding)
+        .map_err(|e| PeerClientError::UntrustedResolution(e.to_string()))?;
+    Ok(peer_id)
 }
 
 /// Error-shape from coord when `/v1/connect` rejects.
@@ -111,6 +160,78 @@ pub async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p2claw_identity::{sign_alias_binding, SigningKey};
+
+    fn signed_response(root: &SigningKey, alias: &str, peer: &PeerId) -> NativeConnectResponse {
+        let sig = sign_alias_binding(root, alias, peer, 1_700_000_000).unwrap();
+        NativeConnectResponse {
+            peer_id: peer.to_z32(),
+            iroh_node_id: peer.to_z32(),
+            iroh_relay_url: None,
+            iroh_direct_addrs: vec![],
+            alias: Some(alias.into()),
+            binding_sig_b64url: Some(URL_SAFE_NO_PAD.encode(sig.to_bytes())),
+            binding_issued_at: Some(1_700_000_000),
+        }
+    }
+
+    #[test]
+    fn verify_accepts_signed_binding() {
+        let root = SigningKey::generate();
+        let peer = SigningKey::generate().peer_id();
+        let resp = signed_response(&root, "blue-otter-7392", &peer);
+        let got = verify_response(&root.peer_id(), "blue-otter-7392", &resp).unwrap();
+        assert_eq!(got, peer);
+    }
+
+    #[test]
+    fn verify_rejects_binding_from_another_root() {
+        let root = SigningKey::generate();
+        let peer = SigningKey::generate().peer_id();
+        let resp = signed_response(&SigningKey::generate(), "blue-otter-7392", &peer);
+        let err = verify_response(&root.peer_id(), "blue-otter-7392", &resp).unwrap_err();
+        assert!(
+            matches!(err, PeerClientError::UntrustedResolution(_)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_unsigned_alias_answer() {
+        let root = SigningKey::generate();
+        let peer = SigningKey::generate().peer_id();
+        let mut resp = signed_response(&root, "blue-otter-7392", &peer);
+        resp.binding_sig_b64url = None;
+        let err = verify_response(&root.peer_id(), "blue-otter-7392", &resp).unwrap_err();
+        assert!(
+            matches!(err, PeerClientError::UntrustedResolution(_)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_node_id_other_than_bound_peer() {
+        let root = SigningKey::generate();
+        let peer = SigningKey::generate().peer_id();
+        let mut resp = signed_response(&root, "blue-otter-7392", &peer);
+        resp.iroh_node_id = SigningKey::generate().peer_id().to_z32();
+        let err = verify_response(&root.peer_id(), "blue-otter-7392", &resp).unwrap_err();
+        assert!(
+            matches!(err, PeerClientError::UntrustedResolution(_)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn verify_accepts_peer_id_target_without_binding() {
+        let root = SigningKey::generate();
+        let peer = SigningKey::generate().peer_id();
+        let mut resp = signed_response(&root, "blue-otter-7392", &peer);
+        resp.alias = None;
+        resp.binding_sig_b64url = None;
+        resp.binding_issued_at = None;
+        verify_response(&root.peer_id(), &peer.to_z32(), &resp).unwrap();
+    }
 
     #[test]
     fn default_coord_url_builds() {
@@ -172,12 +293,6 @@ mod tests {
         assert!(parsed.iroh_relay_url.is_none());
     }
 
-    /// Coord's haiku-binding fields (`alias_kind`,
-    /// `binding_sig_b64url`, `binding_issued_at`) ride alongside the
-    /// fields we deserialise. The native client doesn't verify the
-    /// binding; Iroh's QUIC TLS authenticates the NodeId. Pin that
-    /// the deserialiser accepts the extra fields (no
-    /// `deny_unknown_fields`).
     #[test]
     fn parses_native_response_with_binding_fields() {
         let body = r#"{
@@ -185,15 +300,14 @@ mod tests {
             "iroh_node_id": "y9abcdefghijkmnopqrstuvwxyz234567abcdefghijkmnopqrstu",
             "iroh_relay_url": "https://relay.example.net/",
             "iroh_direct_addrs": ["198.51.100.7:54321"],
+            "alias": "blue-otter-7392",
             "alias_kind": "haiku",
-            "binding_sig_b64url": "MEUCIQDxxxxx...",
+            "binding_sig_b64url": "MEUCIQDxxxxx",
             "binding_issued_at": 1730000000
         }"#;
         let parsed: NativeConnectResponse = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed.iroh_direct_addrs.len(), 1);
-        assert_eq!(
-            parsed.iroh_relay_url.as_deref(),
-            Some("https://relay.example.net/")
-        );
+        assert_eq!(parsed.alias.as_deref(), Some("blue-otter-7392"));
+        assert_eq!(parsed.binding_sig_b64url.as_deref(), Some("MEUCIQDxxxxx"));
+        assert_eq!(parsed.binding_issued_at, Some(1730000000));
     }
 }
