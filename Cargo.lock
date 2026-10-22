@@ -3047,6 +3047,7 @@ dependencies = [
  "hyper-util",
  "iroh",
  "mail-parser",
+ "n0-error",
  "nix 0.29.0",
  "p2claw-control-proto",
  "p2claw-email-proto",

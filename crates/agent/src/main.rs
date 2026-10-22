@@ -9,8 +9,8 @@
 
 #![deny(rust_2018_idioms)]
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-compile_error!("p2claw supports Linux and macOS only. Windows is a non-goal.");
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
+compile_error!("p2claw supports Linux, macOS and Android only. Windows is a non-goal.");
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -43,6 +43,9 @@ mod local_api;
 #[cfg(target_os = "macos")]
 mod macos_install;
 mod register;
+// Android only (the tests run anywhere).
+#[cfg(any(target_os = "android", test))]
+mod system_dns;
 // Compiles cross-platform (no module-level cfg gate) so the pure
 // render-function tests run on Linux dev boxes.
 // Runtime install/uninstall ops are PowerShell-shells-out and
@@ -1765,6 +1768,11 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
     };
     let endpoint_builder =
         iroh::Endpoint::builder(iroh::endpoint::presets::Minimal).relay_mode(relay_mode);
+    // A standalone binary on Android can't read the system DNS
+    // config the way iroh's default resolver expects; ask the OS.
+    #[cfg(target_os = "android")]
+    let endpoint_builder =
+        endpoint_builder.dns_resolver(iroh::dns::DnsResolver::custom(system_dns::SystemResolver));
     let iroh_endpoint = match endpoint_builder
         .secret_key(iroh::SecretKey::from_bytes(&identity.seed()))
         .alpns(vec![iroh_listener::P2CLAW_ALPN.to_vec()])

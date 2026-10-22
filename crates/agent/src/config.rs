@@ -2,8 +2,10 @@
 //!
 //! Produces the on-disk paths for the identity key, persisted
 //! registration state, and the Unix socket used by the local API.
-//! Supports Linux and macOS only; Windows builds are blocked in
-//! `main.rs`.
+//! Supports Linux, macOS and Android; Windows builds are blocked in
+//! `main.rs`. On Android there is no XDG or `/tmp`, so the host app
+//! sets `P2CLAW_AGENT_DATA_DIR` and `P2CLAW_AGENT_RUNTIME_DIR` to
+//! paths inside its own private storage.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -65,7 +67,7 @@ pub fn with_overrides(data_dir: Option<PathBuf>, runtime_dir: Option<PathBuf>) -
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn data_dir() -> Result<PathBuf, ConfigError> {
     if let Ok(v) = env::var("P2CLAW_AGENT_DATA_DIR") {
         if !v.is_empty() {

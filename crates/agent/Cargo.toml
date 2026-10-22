@@ -86,6 +86,9 @@ url = "2"
 
 # Iroh QUIC server (incoming peer connections).
 iroh = "1"
+# Error type for the OS-backed iroh DNS resolver (`system_dns.rs`);
+# same version iroh already pulls in.
+n0-error = "1"
 
 # Local MagicDNS resolver (`dns_resolver.rs`). Pinned to the version
 # iroh already pulls in so the graph keeps a single copy.
