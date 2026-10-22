@@ -239,6 +239,10 @@ pub fn install_system(opts: InstallSystemOpts) -> Result<(), InstallError> {
             std::env::var("P2CLAW_COORD_DOMAIN").ok(),
         ),
         (
+            "P2CLAW_COORD_ROOT_PUBKEY",
+            std::env::var("P2CLAW_COORD_ROOT_PUBKEY").ok(),
+        ),
+        (
             crate::auto_upgrade::RELEASE_REPO_ENV,
             std::env::var(crate::auto_upgrade::RELEASE_REPO_ENV).ok(),
         ),

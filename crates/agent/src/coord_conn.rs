@@ -130,10 +130,10 @@ const DIAL_FAIL_THRESHOLD: u32 = 2;
 /// `agent.state`. Used by the dial-fail recovery branch in the
 /// main loop.
 ///
-/// Refreshes `coord_iroh_direct_addrs`, `coord_iroh_relay_url`,
-/// and (defensively) `coord_root_pubkey` in `AgentState`. The
-/// direct-addrs refresh is the load-bearing fix — coord rebinds
-/// UDP on restart and our persisted addrs go stale.
+/// Refreshes `coord_iroh_direct_addrs` and `coord_iroh_relay_url`
+/// in `AgentState` — coord rebinds UDP on restart and our persisted
+/// addrs go stale. A response naming a different root key is
+/// refused whole.
 ///
 /// Persists to disk; a write failure surfaces as `Err(_)` and the
 /// caller falls through to the existing backoff + re-register path.
@@ -151,13 +151,15 @@ async fn try_refresh_coord_self(
     let new_pubkey = PeerId::from_bytes(*new_endpoint_id.as_bytes());
 
     if new_pubkey != state.coord_root_pubkey {
-        warn!(
-            "coord_conn: /v1/coord-self reports a different coord pubkey \
-             than persisted; coord-key rotation is unsupported — \
-             updating state, but the bootstrap pin will reject signaling \
-             against the new key until the bundle is rebuilt"
+        // The key never changes; a different one means someone else
+        // answered. Keep the addresses we have rather than theirs.
+        error!(
+            recorded = %state.coord_root_pubkey,
+            reported = %new_pubkey,
+            "coord_conn: /v1/coord-self reports a different coordination root key; \
+             ignoring the response"
         );
-        state.coord_root_pubkey = new_pubkey;
+        return Err("coordination root key mismatch".into());
     }
 
     let prior_addrs = state.coord_iroh_direct_addrs.clone();
@@ -185,6 +187,9 @@ async fn try_refresh_coord_self(
 pub async fn run(
     coord_url: String,
     coord_domain: String,
+    // Root key pinned for `coord_domain`, if any; re-registration
+    // must come back with it (or with the recorded key when unpinned).
+    coord_root_pin: Option<PeerId>,
     state: AgentState,
     state_path: PathBuf,
     // Arc so cmd_run can hand the same instance it loaded BEFORE
@@ -242,6 +247,7 @@ pub async fn run(
                 &state_path,
                 &coord_url,
                 &coord_domain,
+                coord_root_pin,
                 &identity,
                 &mut auth_failures,
                 shutdown.clone(),
@@ -354,6 +360,7 @@ pub async fn run(
             &state_path,
             &coord_url,
             &coord_domain,
+            coord_root_pin,
             &identity,
             &mut auth_failures,
             shutdown.clone(),
@@ -388,6 +395,7 @@ async fn handle_session_end(
     state_path: &Path,
     coord_url: &str,
     coord_domain: &str,
+    coord_root_pin: Option<PeerId>,
     identity: &SigningKey,
     auth_failures: &mut VecDeque<Instant>,
     shutdown: watch::Receiver<bool>,
@@ -407,10 +415,13 @@ async fn handle_session_end(
                 return Some(LoopOutcome::AuthFailedTooMany);
             }
             warn!("coord_conn: peer_id rejected (4001); re-registering");
+            let expected =
+                p2claw_agent::coord_pin::expected(coord_root_pin, Some(&state.coord_root_pubkey));
             match register::register_with_retry(
                 coord_url,
                 coord_domain,
                 identity,
+                expected,
                 RegisterRetryPolicy::default(),
                 shutdown,
             )

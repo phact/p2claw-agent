@@ -27,11 +27,10 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::watch;
-use tracing::{info, warn};
-
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64_URL;
+use tracing::{error, info, warn};
 
 use crate::state_store::AgentState;
+use p2claw_agent::coord_pin;
 use p2claw_identity::PeerId;
 
 #[derive(Debug, Error)]
@@ -53,6 +52,11 @@ pub enum RegisterError {
         error: String,
         body: String,
     },
+    /// The response carried a root key other than the pinned or
+    /// recorded one: someone other than our coordination service
+    /// answered. Nothing is persisted.
+    #[error("coordination root key mismatch: expected {expected}, got {got}")]
+    RootKeyMismatch { expected: String, got: String },
     /// The retry loop was cancelled by the shutdown signal.
     #[error("registration cancelled by shutdown")]
     Cancelled,
@@ -95,8 +99,8 @@ pub struct RegisterResponse {
     /// Coord's root pubkey, base64url-no-pad-encoded (32 bytes
     /// decoded). Same key the bootstrap pins for binding-sig
     /// verification. Used as the Iroh `NodeID` the agent dials for
-    /// the control plane. Persisted in `AgentState` and stable
-    /// forever (coord-key rotation is not supported).
+    /// the control plane. [`register`] checks it against the expected
+    /// key (see [`crate::coord_pin`]) before anything is persisted.
     pub coord_root_pubkey_b64url: String,
     /// Coord's iroh relay URL, if it advertises one. Same format
     /// as `/v1/connect`'s `iroh_relay_url`. `Option<String>`
@@ -138,8 +142,8 @@ impl From<RegisterResponse> for AgentState {
         // the dial site refuses, rather than crashing on a bad
         // response. Stable in practice — coord's response is
         // pinned by the integration tests on coord side.
-        let coord_root_pubkey = decode_coord_root_pubkey(&r.coord_root_pubkey_b64url)
-            .unwrap_or_else(|e| {
+        let coord_root_pubkey =
+            coord_pin::decode(&r.coord_root_pubkey_b64url).unwrap_or_else(|e| {
                 warn!(
                     error = %e,
                     raw = %r.coord_root_pubkey_b64url,
@@ -157,15 +161,6 @@ impl From<RegisterResponse> for AgentState {
             coord_iroh_direct_addrs: r.iroh_direct_addrs,
         }
     }
-}
-
-fn decode_coord_root_pubkey(b64: &str) -> Result<PeerId, String> {
-    let raw = B64_URL.decode(b64).map_err(|e| format!("base64: {e}"))?;
-    let bytes: [u8; 32] = raw
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("expected 32 bytes, got {}", raw.len()))?;
-    Ok(PeerId::from_bytes(bytes))
 }
 
 /// Build a signed registration request. Pure — exposed for tests and
@@ -192,6 +187,7 @@ pub async fn register(
     coord_url: &str,
     coord_domain: &str,
     sk: &SigningKey,
+    expected_root: Option<PeerId>,
 ) -> Result<RegisterResponse, RegisterError> {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -216,6 +212,23 @@ pub async fn register(
         });
     }
     let body: RegisterResponse = resp.json().await?;
+    if let Some(expected) = expected_root {
+        let got = coord_pin::decode(&body.coord_root_pubkey_b64url);
+        if got.as_ref() != Ok(&expected) {
+            let got = got
+                .map(|k| k.to_string())
+                .unwrap_or_else(|_| body.coord_root_pubkey_b64url.clone());
+            error!(
+                %expected, %got,
+                "register: coordination answered with a different root key; \
+                 not trusting it"
+            );
+            return Err(RegisterError::RootKeyMismatch {
+                expected: expected.to_string(),
+                got,
+            });
+        }
+    }
     Ok(body)
 }
 
@@ -223,8 +236,8 @@ pub async fn register(
 /// refresh — no token rotation, no DB writes, no proof. The agent
 /// calls this on N consecutive Iroh dial timeouts, persists the
 /// result into `agent.state` (`coord_iroh_direct_addrs` +
-/// `coord_iroh_relay_url` + maybe `coord_root_pubkey` if rotation
-/// ever ships), and retries the dial.
+/// `coord_iroh_relay_url`, only when `endpoint_id` matches the
+/// recorded root key), and retries the dial.
 ///
 /// `endpoint_id` is z-base-32 here, NOT base64url-no-pad like
 /// `RegisterResponse.coord_root_pubkey_b64url`; the endpoint uses
@@ -342,6 +355,7 @@ pub async fn register_with_retry(
     coord_url: &str,
     coord_domain: &str,
     sk: &SigningKey,
+    expected_root: Option<PeerId>,
     policy: RegisterRetryPolicy,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<RegisterResponse, RegisterError> {
@@ -352,7 +366,7 @@ pub async fn register_with_retry(
             return Err(RegisterError::Cancelled);
         }
         attempt += 1;
-        let disp = attempt_register(coord_url, coord_domain, sk, attempt).await;
+        let disp = attempt_register(coord_url, coord_domain, sk, expected_root, attempt).await;
         match disp {
             Disposition::Done(resp) => return Ok(*resp),
             Disposition::Permanent {
@@ -400,10 +414,11 @@ async fn attempt_register(
     coord_url: &str,
     coord_domain: &str,
     sk: &SigningKey,
+    expected_root: Option<PeerId>,
     attempt: u32,
 ) -> Disposition {
     info!(attempt, "register: attempting POST /v1/register");
-    match register(coord_url, coord_domain, sk).await {
+    match register(coord_url, coord_domain, sk, expected_root).await {
         Ok(resp) => Disposition::Done(Box::new(resp)),
         Err(RegisterError::Coord { status, body }) => classify_status(status, body),
         Err(e @ RegisterError::Clock(_)) => Disposition::Permanent {
@@ -427,6 +442,13 @@ async fn attempt_register(
                 hint: None,
             }
         }
+        // Whoever answered isn't our coordination service. Keep
+        // retrying: an intercepting network is usually temporary, and
+        // nothing was persisted.
+        Err(e @ RegisterError::RootKeyMismatch { .. }) => Disposition::Transient {
+            reason: e.to_string(),
+            hint: None,
+        },
         // The retry loop is the only producer of these — `register()`
         // never builds them — so the arms are unreachable in practice.
         // Cover them defensively rather than panicking.
@@ -525,6 +547,7 @@ fn jitter(base: Duration) -> Duration {
 mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64_URL;
 
     #[test]
     fn build_request_fields_are_b64url_and_valid() {
@@ -892,15 +915,83 @@ mod tests {
         let coord_url = format!("http://127.0.0.1:{port}");
         let (_sd_tx, sd_rx) = watch::channel(false);
 
-        let resp = register_with_retry(&coord_url, "coord.p2claw.com", &sk, fast_policy(), sd_rx)
-            .await
-            .expect("retry loop should succeed on the third attempt");
+        let resp = register_with_retry(
+            &coord_url,
+            "coord.p2claw.com",
+            &sk,
+            None,
+            fast_policy(),
+            sd_rx,
+        )
+        .await
+        .expect("retry loop should succeed on the third attempt");
         assert_eq!(resp.alias, "calm-river-hat");
         assert!(
             counter.load(Ordering::SeqCst) >= 3,
             "expected ≥3 coord attempts, saw {}",
             counter.load(Ordering::SeqCst)
         );
+    }
+
+    #[tokio::test]
+    async fn register_accepts_matching_root_key() {
+        let (port, _) = spawn_mock_coord(vec![http_response("200 OK", &happy_body())]).await;
+        let sk = SigningKey::generate();
+        let coord_url = format!("http://127.0.0.1:{port}");
+        let resp = register(
+            &coord_url,
+            "coord.p2claw.com",
+            &sk,
+            Some(PeerId::from_bytes([0xEF; 32])),
+        )
+        .await
+        .expect("matching root key registers");
+        assert_eq!(resp.alias, "calm-river-hat");
+    }
+
+    #[tokio::test]
+    async fn register_refuses_unexpected_root_key() {
+        let (port, _) = spawn_mock_coord(vec![http_response("200 OK", &happy_body())]).await;
+        let sk = SigningKey::generate();
+        let coord_url = format!("http://127.0.0.1:{port}");
+        let err = register(
+            &coord_url,
+            "coord.p2claw.com",
+            &sk,
+            Some(PeerId::from_bytes([0x11; 32])),
+        )
+        .await
+        .expect_err("a different root key must not register");
+        assert!(
+            matches!(err, RegisterError::RootKeyMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_with_retry_keeps_retrying_on_root_key_mismatch() {
+        let mut wrong = serde_json::from_slice::<serde_json::Value>(&happy_body()).unwrap();
+        wrong["coord_root_pubkey_b64url"] = B64_URL.encode([0x11u8; 32]).into();
+        let responses = vec![
+            http_response("200 OK", &serde_json::to_vec(&wrong).unwrap()),
+            http_response("200 OK", &happy_body()),
+        ];
+        let (port, counter) = spawn_mock_coord(responses).await;
+        let sk = SigningKey::generate();
+        let coord_url = format!("http://127.0.0.1:{port}");
+        let (_sd_tx, sd_rx) = watch::channel(false);
+        let resp = register_with_retry(
+            &coord_url,
+            "coord.p2claw.com",
+            &sk,
+            Some(PeerId::from_bytes([0xEF; 32])),
+            fast_policy(),
+            sd_rx,
+        )
+        .await
+        .expect("the genuine response on retry registers");
+        assert_eq!(resp.coord_root_pubkey_b64url, B64_URL.encode([0xEFu8; 32]));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -912,9 +1003,16 @@ mod tests {
         let coord_url = format!("http://127.0.0.1:{port}");
         let (_sd_tx, sd_rx) = watch::channel(false);
 
-        let err = register_with_retry(&coord_url, "coord.p2claw.com", &sk, fast_policy(), sd_rx)
-            .await
-            .expect_err("410 must surface as a permanent error");
+        let err = register_with_retry(
+            &coord_url,
+            "coord.p2claw.com",
+            &sk,
+            None,
+            fast_policy(),
+            sd_rx,
+        )
+        .await
+        .expect_err("410 must surface as a permanent error");
         match err {
             RegisterError::Permanent { status, error, .. } => {
                 assert_eq!(status, 410);
@@ -955,7 +1053,7 @@ mod tests {
             multiplier: 2,
         };
         let started = std::time::Instant::now();
-        let resp = register_with_retry(&coord_url, "coord.p2claw.com", &sk, policy, sd_rx)
+        let resp = register_with_retry(&coord_url, "coord.p2claw.com", &sk, None, policy, sd_rx)
             .await
             .expect("should succeed after honoring 429");
         let elapsed = started.elapsed();
@@ -982,7 +1080,15 @@ mod tests {
         let handle = tokio::spawn({
             let coord_url = coord_url.clone();
             async move {
-                register_with_retry(&coord_url, "coord.p2claw.com", &sk, fast_policy(), sd_rx).await
+                register_with_retry(
+                    &coord_url,
+                    "coord.p2claw.com",
+                    &sk,
+                    None,
+                    fast_policy(),
+                    sd_rx,
+                )
+                .await
             }
         });
 

@@ -21,6 +21,7 @@
 
 pub mod attestation;
 pub mod auto_upgrade;
+pub mod coord_pin;
 pub mod dc_stream;
 pub mod email;
 pub mod forwarder;

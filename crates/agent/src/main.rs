@@ -73,7 +73,7 @@ use p2claw_agent::routes::RouteTable;
 
 /// Compiled-in default coordination FQDN. Override with `--coord-domain`
 /// or the `P2CLAW_COORD_DOMAIN` env var.
-const DEFAULT_COORD_DOMAIN: &str = "coord.p2claw.com";
+use p2claw_agent::coord_pin::DEFAULT_COORD_DOMAIN;
 
 /// Compile-time default for the `--parent-domain` flag.
 ///
@@ -115,6 +115,14 @@ struct Cli {
     /// `http://127.0.0.1:8081`.
     #[arg(long, env = "P2CLAW_COORD_URL")]
     coord_url: Option<String>,
+
+    /// Root public key of the coordination service (base64url, 32
+    /// bytes). Registration fails if coordination answers with any
+    /// other key. Defaults to the built-in key for the default
+    /// coordination domain; for other domains, the key from first
+    /// registration is kept.
+    #[arg(long, env = "P2CLAW_COORD_ROOT_PUBKEY")]
+    coord_root_pubkey: Option<String>,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -764,6 +772,16 @@ fn main() -> ExitCode {
         .coord_url
         .clone()
         .unwrap_or_else(|| format!("https://{}", cli.coord_domain));
+    let coord_root_pin = match p2claw_agent::coord_pin::pinned(
+        &cli.coord_domain,
+        cli.coord_root_pubkey.as_deref(),
+    ) {
+        Ok(pin) => pin,
+        Err(e) => {
+            error!(error = %e, "invalid --coord-root-pubkey");
+            return ExitCode::from(2);
+        }
+    };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -782,8 +800,10 @@ fn main() -> ExitCode {
             Cmd::Status { json } => cli_client::cmd_status(json).await,
             Cmd::Sessions { json } => cli_client::cmd_sessions(json).await,
             Cmd::Peer { name, json } => cli_client::cmd_peer(name, json).await,
-            Cmd::Register => cmd_register(&paths, &coord_url, &cli.coord_domain).await,
-            Cmd::Run => cmd_run(&paths, &coord_url, &cli.coord_domain).await,
+            Cmd::Register => {
+                cmd_register(&paths, &coord_url, &cli.coord_domain, coord_root_pin).await
+            }
+            Cmd::Run => cmd_run(&paths, &coord_url, &cli.coord_domain, coord_root_pin).await,
             // Flat `unexpose` / `routes` were dropped; both now
             // live as `apps unexpose` / `apps list`.
             Cmd::Apps { command } => cmd_apps(command).await,
@@ -1423,7 +1443,12 @@ async fn cmd_identity(paths: &config::Paths) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn cmd_register(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> ExitCode {
+async fn cmd_register(
+    paths: &config::Paths,
+    coord_url: &str,
+    coord_domain: &str,
+    coord_root_pin: Option<p2claw_identity::PeerId>,
+) -> ExitCode {
     let sk = match SigningKey::load_or_generate(&paths.identity_key()) {
         Ok(k) => k,
         Err(e) => {
@@ -1432,7 +1457,12 @@ async fn cmd_register(paths: &config::Paths, coord_url: &str, coord_domain: &str
         }
     };
     info!(coord_url, "registering");
-    match register::register(coord_url, coord_domain, &sk).await {
+    let recorded = state_store::load(&paths.agent_state()).ok().flatten();
+    let expected = p2claw_agent::coord_pin::expected(
+        coord_root_pin,
+        recorded.as_ref().map(|s| &s.coord_root_pubkey),
+    );
+    match register::register(coord_url, coord_domain, &sk, expected).await {
         Ok(resp) => {
             let state: state_store::AgentState = resp.into();
             if let Err(e) = state_store::save(&paths.agent_state(), &state) {
@@ -1457,7 +1487,12 @@ fn oauth_broker_url() -> String {
         .unwrap_or_else(|| p2claw_agent::oauth::DEFAULT_BROKER_URL.to_string())
 }
 
-async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> ExitCode {
+async fn cmd_run(
+    paths: &config::Paths,
+    coord_url: &str,
+    coord_domain: &str,
+    coord_root_pin: Option<p2claw_identity::PeerId>,
+) -> ExitCode {
     let sk = match SigningKey::load_or_generate(&paths.identity_key()) {
         Ok(k) => k,
         Err(e) => {
@@ -1487,12 +1522,27 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
             None
         }
     };
+    if let (Some(pin), Some(s)) = (coord_root_pin, state.as_ref()) {
+        let recorded = s.coord_root_pubkey;
+        if recorded.as_bytes() != &[0u8; 32] && recorded != pin {
+            error!(
+                recorded = %recorded,
+                expected = %pin,
+                path = %paths.agent_state().display(),
+                "agent.state names a coordination root key this agent doesn't trust; \
+                 if you moved to a different coordination service, remove agent.state \
+                 to register again"
+            );
+            return ExitCode::from(2);
+        }
+    }
     if state.is_none() {
         info!("no agent.state on disk; registering with retry");
         match register::register_with_retry(
             coord_url,
             coord_domain,
             &sk,
+            coord_root_pin,
             register::RegisterRetryPolicy::default(),
             sd_rx.clone(),
         )
@@ -2198,6 +2248,7 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
             coord_conn::run(
                 coord_url,
                 coord_domain,
+                coord_root_pin,
                 state,
                 state_path,
                 sk,
