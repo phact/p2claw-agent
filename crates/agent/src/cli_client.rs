@@ -101,6 +101,15 @@ struct SessionEntryResponse {
     #[serde(default)]
     kind: String,
     transport: String,
+    /// Remote `ip:port`; `null` when relayed or not known yet.
+    #[serde(default)]
+    addr: Option<String>,
+    /// iroh only: the remote endpoint id.
+    #[serde(default)]
+    peer_id: Option<String>,
+    /// iroh only: the peer is the operator's edge.
+    #[serde(default)]
+    edge: bool,
     age_secs: u64,
 }
 
@@ -807,18 +816,42 @@ pub async fn cmd_sessions(json: bool) -> ExitCode {
         println!("no active visitor sessions");
         return ExitCode::SUCCESS;
     }
-    println!("{:<40}  {:<8}  {:<9}  AGE", "SESSION", "KIND", "TRANSPORT");
+    print!("{}", sessions_table(&s));
+    println!("\n{} active session(s)", s.count);
+    ExitCode::SUCCESS
+}
+
+/// The `p2claw sessions` table. A relayed session shows `(relayed)`
+/// rather than an address: the one the box sees is the relay's. The
+/// peer id goes last and in full, so it can be copied into
+/// `p2claw share`.
+fn sessions_table(s: &SessionsResponse) -> String {
+    let mut out = format!(
+        "{:<40}  {:<8}  {:<9}  {:<24}  {:<7}  PEER\n",
+        "SESSION", "KIND", "TRANSPORT", "ADDRESS", "AGE"
+    );
     for e in &s.sessions {
-        println!(
-            "{:<40}  {:<8}  {:<9}  {}",
+        let addr = match (&e.addr, e.transport.as_str()) {
+            (Some(a), _) => a.as_str(),
+            (None, "relay") => "(relayed)",
+            (None, _) => "-",
+        };
+        let peer = match (&e.peer_id, e.edge) {
+            (Some(p), true) => format!("{p} (edge)"),
+            (Some(p), false) => p.clone(),
+            (None, _) => "-".into(),
+        };
+        out.push_str(&format!(
+            "{:<40}  {:<8}  {:<9}  {:<24}  {:<7}  {}\n",
             e.id,
             e.kind,
             e.transport,
-            fmt_duration(e.age_secs)
-        );
+            addr,
+            fmt_duration(e.age_secs),
+            peer
+        ));
     }
-    println!("\n{} active session(s)", s.count);
-    ExitCode::SUCCESS
+    out
 }
 
 fn render_auth_method(m: &p2claw_control_proto::AuthMethod) -> String {
@@ -1026,5 +1059,83 @@ pub(crate) fn stdout_write_raw(bytes: &[u8]) {
     let _ = lock.write_all(bytes);
     if bytes.last() != Some(&b'\n') {
         let _ = lock.write_all(b"\n");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sessions_table_shows_address_relayed_and_peer() {
+        let s: SessionsResponse = serde_json::from_value(serde_json::json!({
+            "count": 4,
+            "sessions": [
+                {"id": "sess-direct", "kind": "browser", "transport": "direct",
+                 "addr": "203.0.113.7:51234", "age_secs": 5},
+                {"id": "sess-turn", "kind": "browser", "transport": "relay",
+                 "addr": null, "age_secs": 65},
+                {"id": "iroh-0", "kind": "iroh", "transport": "direct",
+                 "addr": "198.51.100.4:4433", "peer_id": "peerz32", "age_secs": 7},
+                {"id": "iroh-1", "kind": "iroh", "transport": "relay",
+                 "addr": null, "peer_id": "edgez32", "edge": true, "age_secs": 8},
+            ]
+        }))
+        .unwrap();
+        let t = sessions_table(&s);
+        let rows: Vec<Vec<&str>> = t
+            .lines()
+            .map(|l| {
+                l.split("  ")
+                    .map(str::trim)
+                    .filter(|c| !c.is_empty())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                vec!["SESSION", "KIND", "TRANSPORT", "ADDRESS", "AGE", "PEER"],
+                vec![
+                    "sess-direct",
+                    "browser",
+                    "direct",
+                    "203.0.113.7:51234",
+                    "5s",
+                    "-"
+                ],
+                vec!["sess-turn", "browser", "relay", "(relayed)", "1m 5s", "-"],
+                vec![
+                    "iroh-0",
+                    "iroh",
+                    "direct",
+                    "198.51.100.4:4433",
+                    "7s",
+                    "peerz32"
+                ],
+                vec![
+                    "iroh-1",
+                    "iroh",
+                    "relay",
+                    "(relayed)",
+                    "8s",
+                    "edgez32 (edge)"
+                ],
+            ],
+            "{t}"
+        );
+    }
+
+    /// An agent that predates the address fields still renders.
+    #[test]
+    fn sessions_table_older_agent() {
+        let s: SessionsResponse = serde_json::from_value(serde_json::json!({
+            "count": 1,
+            "sessions": [{"id": "sess", "kind": "browser", "transport": "unknown", "age_secs": 1}]
+        }))
+        .unwrap();
+        let t = sessions_table(&s);
+        let row = t.lines().nth(1).unwrap();
+        assert!(row.contains(" - "), "{t}");
     }
 }

@@ -83,7 +83,24 @@ async fn handle(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infalli
         .and_then(|v| v.to_str().ok())
         .unwrap_or("<missing>")
         .to_string();
-    let body = format!("method={method} path={path} host={host}");
+    // Every `X-Forwarded-For` line, joined, so a forged one left
+    // beside the agent's would show.
+    let all = |name: &str| {
+        let v: Vec<&str> = req
+            .headers()
+            .get_all(name)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        if v.is_empty() {
+            "<none>".to_string()
+        } else {
+            v.join("|")
+        }
+    };
+    let xff = all("x-forwarded-for");
+    let relayed = all("x-p2claw-relayed");
+    let body = format!("method={method} path={path} host={host} xff={xff} relayed={relayed}");
     Ok(Response::new(Full::new(Bytes::from(body))))
 }
 
@@ -239,6 +256,103 @@ async fn forwarder_returns_502_when_upstream_refuses() {
     // Both sides of tokio::io::duplex park each other on EOF, so
     // `serve_handle.await` would hang. Abort and move on.
     serve_handle.abort();
+}
+
+/// `X-Forwarded-For` through the real forwarder: a visitor's forged
+/// value never reaches the app; the transport's direct address
+/// replaces it; a relayed path carries no address and says which
+/// relay; the edge's value (its front proxy's last hop) is kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarder_sets_forwarded_for_from_the_transport() {
+    use p2claw_agent::remote_addr::{EdgePeers, Relay, Remote, SharedRemote};
+
+    let (upstream_port, shutdown_upstream) = spawn_echo_server().await;
+    let dir = tempdir().unwrap();
+    let routes = RouteTable::load_or_empty(dir.path().join("routes.json"));
+    routes
+        .upsert(RouteRecord {
+            name: "echo".into(),
+            upstream: format!("http://127.0.0.1:{upstream_port}"),
+            registered_at: 0,
+            auth: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("upsert echo route");
+    let edge_peers = EdgePeers::default();
+    edge_peers.replace(["edgepeer".to_string()]);
+    let base = Forwarder::new(routes, PARENT_DOMAIN.into()).with_edge_peers(edge_peers);
+
+    // One request with a forged XFF (and a forged relayed marker)
+    // through `forwarder`; returns the echoed body.
+    async fn fetch(forwarder: Forwarder, xff: &str) -> String {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let serve_handle = tokio::spawn(p2claw_translator::serve(server_io, forwarder));
+        let client = ClientConnection::spawn(client_io);
+        let req = ClientRequest::get(Bytes::from_static(b"/"))
+            .header(
+                Bytes::from_static(b"host"),
+                Bytes::from(format!("echo-{ALIAS}.{PARENT_DOMAIN}")),
+            )
+            .header(
+                Bytes::from_static(b"X-Forwarded-For"),
+                Bytes::from(xff.to_string()),
+            )
+            .header(
+                Bytes::from_static(b"X-P2claw-Relayed"),
+                Bytes::from_static(b"forged"),
+            );
+        let resp = client.request(req).await.expect("client request");
+        assert_eq!(resp.status, 200);
+        let body = resp.body.collect().await;
+        drop(client);
+        serve_handle.abort();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+    let with = |remote: Remote| {
+        let shared = SharedRemote::default();
+        shared.set(remote);
+        base.with_remote(Arc::new(shared))
+    };
+
+    let direct = with(Remote::Direct(Some("203.0.113.7:51234".parse().unwrap())));
+    let body = fetch(direct, "6.6.6.6").await;
+    assert!(
+        body.contains("xff=203.0.113.7 relayed=<none>"),
+        "direct: {body}"
+    );
+
+    let body = fetch(with(Remote::Relayed(Relay::Turn)), "6.6.6.6").await;
+    assert!(body.contains("xff=<none> relayed=turn"), "turn: {body}");
+
+    let body = fetch(with(Remote::Relayed(Relay::Iroh)), "6.6.6.6").await;
+    assert!(
+        body.contains("xff=<none> relayed=iroh-relay"),
+        "iroh relay: {body}"
+    );
+
+    // No transport info at all: still stripped.
+    let body = fetch(base.clone(), "6.6.6.6").await;
+    assert!(body.contains("xff=<none> relayed=<none>"), "bare: {body}");
+
+    // A non-edge iroh peer can't pass its own XFF along.
+    let peer = base
+        .for_peer("somepeer".into())
+        .with_remote(Arc::new(SharedRemote::default()));
+    let body = fetch(peer, "6.6.6.6").await;
+    assert!(body.contains("xff=<none>"), "non-edge peer: {body}");
+
+    // The edge: its front proxy's hop is kept, the edge server's own
+    // address isn't used.
+    let edge =
+        with(Remote::Direct(Some("192.0.2.10:443".parse().unwrap()))).for_peer("edgepeer".into());
+    let body = fetch(edge, "6.6.6.6, 203.0.113.9").await;
+    assert!(
+        body.contains("xff=203.0.113.9 relayed=<none>"),
+        "edge: {body}"
+    );
+
+    let _ = shutdown_upstream.send(());
 }
 
 // `Forwarder` is `Clone` (internal `Arc`), so the agent can hand the

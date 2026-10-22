@@ -164,6 +164,7 @@ async fn decide_session(
             Bytes::from_static(PEER_HEADER.as_bytes()),
             Bytes::from(peer.into_bytes()),
         ));
+        forwarder.set_forwarded_for(&mut upstream_headers);
         return WsUpgradeDecision::Accept {
             headers: Vec::new(),
             upstream_headers,
@@ -208,12 +209,14 @@ async fn decide_session(
     // own header (bearer / vendor token), so an allowlist would break
     // the handshake. `oauth_mw::apply` has already stripped inbound
     // `X-P2claw-*` and `__p2claw_session`, so what remains is trusted.
-    let upstream_headers: Vec<(Bytes, Bytes)> = auth_req
+    let mut upstream_headers: Vec<(Bytes, Bytes)> = auth_req
         .headers
         .iter()
         .filter(|(name, _)| !is_ws_hop_or_handshake_header(name))
         .cloned()
         .collect();
+    // Same `X-Forwarded-For` rule as the plain-HTTP path.
+    forwarder.set_forwarded_for(&mut upstream_headers);
 
     WsUpgradeDecision::Accept {
         headers: Vec::new(),

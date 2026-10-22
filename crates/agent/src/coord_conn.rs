@@ -50,6 +50,7 @@ use crate::signal_handler::{OutboundSignal, SignalRegistry};
 use crate::state_store::{self, AgentState};
 use p2claw_agent::email::{drain, EmailStream, Inbox};
 use p2claw_agent::oauth_grants::OauthGrants;
+use p2claw_agent::remote_addr::EdgePeers;
 use p2claw_agent::routes::{RouteRecord, RouteTable};
 
 /// Build the `route_announce` payload from a route-table snapshot.
@@ -201,6 +202,9 @@ pub async fn run(
     email: EmailShared,
     mut email_inbox: EmailLinkInbox,
     oauth_grants: Arc<OauthGrants>,
+    // Filled from each `hello_ack`; the forwarder reads it to tell
+    // edge traffic apart (`X-Forwarded-For`).
+    edge_peers: EdgePeers,
     // Sender for `CoordHealth`; receiver lives on the post-upgrade
     // watchdog (or is dropped if no watchdog is running).
     coord_health: watch::Sender<CoordHealth>,
@@ -284,6 +288,7 @@ pub async fn run(
                 &mut email_inbox,
                 &oauth_grants,
                 &identity,
+                &edge_peers,
                 &coord_health,
             ) => res,
             _ = shutdown.changed() => Ok(SessionEnd::Shutdown),
@@ -480,6 +485,7 @@ async fn session(
     email_inbox: &mut EmailLinkInbox,
     oauth_grants: &OauthGrants,
     identity: &Arc<SigningKey>,
+    edge_peers: &EdgePeers,
     coord_health: &watch::Sender<CoordHealth>,
 ) -> Result<SessionEnd, SessionError> {
     // Build an addressed `EndpointAddr` from the persisted relay URL
@@ -541,8 +547,17 @@ async fn session(
 
     match read_envelope(&mut ctrl_recv).await? {
         env if matches!(env.body, Message::HelloAck { .. }) => {
-            if let Message::HelloAck { server_time } = env.body {
-                info!(server_time, "coord_conn: hello_ack");
+            if let Message::HelloAck {
+                server_time,
+                edge_peer_ids,
+            } = env.body
+            {
+                info!(
+                    server_time,
+                    edges = edge_peer_ids.len(),
+                    "coord_conn: hello_ack"
+                );
+                edge_peers.replace(edge_peer_ids);
             }
             let _ = coord_health.send(CoordHealth::ConnectedHelloAck);
         }

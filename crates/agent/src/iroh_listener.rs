@@ -28,6 +28,8 @@ use tokio::sync::watch;
 use tracing::{debug, info};
 
 use p2claw_translator::Handler;
+
+use crate::remote_addr::{EdgePeers, Relay, Remote, RemoteSource};
 // `Forwarder` + `SecretKey` + `presets` are only referenced from
 // the test module (the production path builds the endpoint in
 // `main.rs::cmd_run` and passes it to `serve_endpoint`).
@@ -39,30 +41,17 @@ pub const P2CLAW_ALPN: &[u8] = b"p2claw/1";
 #[derive(Debug, Error)]
 pub enum IrohListenerError {}
 
-/// Transport of an iroh connection's selected network path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IrohTransport {
-    Unknown,
-    Direct,
-    Relay,
-}
-
-impl IrohTransport {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            IrohTransport::Unknown => "unknown",
-            IrohTransport::Direct => "direct",
-            IrohTransport::Relay => "relay",
-        }
-    }
-}
-
 /// One active iroh connection, as reported by `GET /v1/sessions`.
-/// Metadata only — no addresses.
 #[derive(Debug, Clone)]
 pub struct IrohSessionSnapshot {
     pub id: String,
-    pub transport: IrohTransport,
+    /// Selected path and, when direct, the peer's address.
+    pub remote: Remote,
+    /// z-base-32 remote endpoint id (the authenticated peer).
+    pub peer_id: String,
+    /// The peer is the operator's edge: the address is the edge
+    /// server's, and the connection carries many visitors.
+    pub edge: bool,
     pub age_secs: u64,
 }
 
@@ -79,6 +68,8 @@ pub struct IrohSessionSnapshot {
 pub struct IrohSessionRegistry {
     next_id: AtomicU64,
     conns: std::sync::Mutex<HashMap<u64, IrohConnEntry>>,
+    /// To flag edge connections in the snapshot.
+    edge_peers: EdgePeers,
 }
 
 struct IrohConnEntry {
@@ -107,6 +98,15 @@ impl IrohSessionRegistry {
         Arc::new(Self::default())
     }
 
+    /// A registry that flags connections from `edge_peers` (the set
+    /// the forwarder and the coord connection share).
+    pub fn with_edge_peers(edge_peers: EdgePeers) -> Arc<Self> {
+        Arc::new(Self {
+            edge_peers,
+            ..Self::default()
+        })
+    }
+
     /// Register a live connection; the returned guard deregisters it
     /// on drop.
     fn track(self: &Arc<Self>, conn: iroh::endpoint::Connection) -> IrohSessionGuard {
@@ -127,34 +127,55 @@ impl IrohSessionRegistry {
         }
     }
 
-    /// Snapshot of the active connections. Transport is sampled live
-    /// from each connection's selected network path, so a connection
-    /// that migrates between relay and direct reports its current
-    /// path.
+    /// Snapshot of the active connections. The path is sampled live
+    /// from each connection, so a connection that migrates between
+    /// relay and direct reports its current path and address.
     pub fn list_sessions(&self) -> Vec<IrohSessionSnapshot> {
         self.conns
             .lock()
             .expect("iroh session registry mutex poisoned")
             .iter()
-            .map(|(id, entry)| IrohSessionSnapshot {
-                id: format!("iroh-{id}"),
-                transport: conn_transport(&entry.conn),
-                age_secs: entry.started_at.elapsed().as_secs(),
+            .map(|(id, entry)| {
+                let peer_id = entry.conn.remote_id().to_z32();
+                IrohSessionSnapshot {
+                    id: format!("iroh-{id}"),
+                    remote: conn_remote(&entry.conn),
+                    edge: self.edge_peers.contains(&peer_id),
+                    peer_id,
+                    age_secs: entry.started_at.elapsed().as_secs(),
+                }
             })
             .collect()
     }
 }
 
-/// Best-effort transport of a connection's selected path: `Relay`
-/// if the path goes through a relay server, `Direct` for an IP path,
-/// `Unknown` when no path is selected (yet).
-fn conn_transport(conn: &iroh::endpoint::Connection) -> IrohTransport {
+/// Best-effort remote of a connection's selected path: the peer's
+/// address for an IP path, [`Relay::Iroh`] if the path goes through
+/// a relay server (whose address isn't the peer's), `Unknown` when
+/// no path is selected (yet).
+pub fn conn_remote(conn: &iroh::endpoint::Connection) -> Remote {
     let paths = conn.paths();
-    let selected_is_relay = paths.iter().find(|p| p.is_selected()).map(|p| p.is_relay());
-    match selected_is_relay {
-        Some(true) => IrohTransport::Relay,
-        Some(false) => IrohTransport::Direct,
-        None => IrohTransport::Unknown,
+    let selected = paths
+        .iter()
+        .find(|p| p.is_selected())
+        .map(|p| p.remote_addr().clone());
+    match selected {
+        Some(TransportAddr::Ip(addr)) => Remote::Direct(Some(addr)),
+        Some(TransportAddr::Relay(_)) => Remote::Relayed(Relay::Iroh),
+        // `Custom` transports are iroh-internal; the path exists
+        // but there's no IP to report.
+        Some(_) => Remote::Direct(None),
+        None => Remote::Unknown,
+    }
+}
+
+/// [`RemoteSource`] over a live iroh connection: the forwarder asks
+/// per request, so `X-Forwarded-For` follows the path as it changes.
+pub struct IrohRemote(pub iroh::endpoint::Connection);
+
+impl RemoteSource for IrohRemote {
+    fn remote(&self) -> Remote {
+        conn_remote(&self.0)
     }
 }
 
@@ -225,13 +246,45 @@ where
 pub async fn serve_endpoint_per_peer<H, F>(
     endpoint: Endpoint,
     addrs_tx: watch::Sender<Vec<String>>,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     make_session: F,
     sessions: Option<Arc<IrohSessionRegistry>>,
 ) -> Result<(), IrohListenerError>
 where
     H: Handler + Clone,
     F: Fn(iroh::EndpointId) -> (H, Option<std::sync::Arc<dyn p2claw_translator::WsHandler>>)
+        + Send
+        + Sync
+        + Clone
+        + 'static,
+{
+    serve_endpoint_per_conn(
+        endpoint,
+        addrs_tx,
+        shutdown,
+        move |conn: &iroh::endpoint::Connection| make_session(conn.remote_id()),
+        sessions,
+    )
+    .await
+}
+
+/// Variant of [`serve_endpoint_per_peer`] whose factory gets the
+/// whole accepted connection, not just its remote id. Production
+/// uses it to bind the connection into the forwarder too (via
+/// `Forwarder::with_remote` and [`IrohRemote`]), so each request's
+/// `X-Forwarded-For` is the connection's current remote address.
+pub async fn serve_endpoint_per_conn<H, F>(
+    endpoint: Endpoint,
+    addrs_tx: watch::Sender<Vec<String>>,
+    mut shutdown: watch::Receiver<bool>,
+    make_session: F,
+    sessions: Option<Arc<IrohSessionRegistry>>,
+) -> Result<(), IrohListenerError>
+where
+    H: Handler + Clone,
+    F: Fn(
+            &iroh::endpoint::Connection,
+        ) -> (H, Option<std::sync::Arc<dyn p2claw_translator::WsHandler>>)
         + Send
         + Sync
         + Clone
@@ -295,7 +348,9 @@ async fn accept_loop<H, F>(
 ) -> Result<(), IrohListenerError>
 where
     H: Handler + Clone,
-    F: Fn(iroh::EndpointId) -> (H, Option<std::sync::Arc<dyn p2claw_translator::WsHandler>>)
+    F: Fn(
+            &iroh::endpoint::Connection,
+        ) -> (H, Option<std::sync::Arc<dyn p2claw_translator::WsHandler>>)
         + Send
         + Sync
         + Clone
@@ -321,9 +376,9 @@ where
                     match accepting.await {
                         Ok(conn) => {
                             // Handler construction happens AFTER the
-                            // QUIC handshake, so the remote id fed to
-                            // the factory is authenticated.
-                            let (handler, ws_handler) = make_session(conn.remote_id());
+                            // QUIC handshake, so the remote id the
+                            // factory reads is authenticated.
+                            let (handler, ws_handler) = make_session(&conn);
                             handle_connection(conn, handler, ws_handler, sessions).await
                         }
                         Err(e) => debug!(error = %e, "iroh: accepting handshake failed"),
@@ -596,7 +651,12 @@ mod tests {
 
         let (addrs_tx, _addrs_rx) = watch::channel::<Vec<String>>(Vec::new());
         let (sd_tx, sd_rx) = watch::channel(false);
-        let registry = IrohSessionRegistry::new();
+        let client_endpoint = test_endpoint(None).await;
+        let client_z32 = client_endpoint.id().to_z32();
+        // The client stands in for the edge: its snapshot is flagged.
+        let edge_peers = EdgePeers::default();
+        edge_peers.replace([client_z32.clone()]);
+        let registry = IrohSessionRegistry::with_edge_peers(edge_peers);
 
         let server_handle = tokio::spawn({
             let endpoint = server_endpoint.clone();
@@ -607,7 +667,6 @@ mod tests {
             }
         });
 
-        let client_endpoint = test_endpoint(None).await;
         let server_addr = EndpointAddr::from_parts(server_id, [TransportAddr::Ip(dial_addr)]);
         let connection = tokio::time::timeout(
             Duration::from_secs(5),
@@ -632,13 +691,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         };
         assert!(session.id.starts_with("iroh-"), "id: {}", session.id);
+        assert_eq!(
+            session.peer_id, client_z32,
+            "peer id is the remote endpoint"
+        );
+        assert!(session.edge, "a peer in the edge set is flagged");
         // Loopback IP path — never a relay. `Unknown` is tolerated
         // only until a path is selected, so wait for a definite answer.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match registry.list_sessions().first().map(|s| s.transport) {
-                Some(IrohTransport::Direct) => break,
-                Some(IrohTransport::Relay) => panic!("loopback connection reported relay"),
+            match registry.list_sessions().first().map(|s| s.remote) {
+                Some(Remote::Direct(addr)) => {
+                    let addr = addr.expect("a direct IP path has an address");
+                    assert!(addr.ip().is_loopback(), "loopback dial: {addr}");
+                    break;
+                }
+                Some(Remote::Relayed(_)) => panic!("loopback connection reported relay"),
                 _ => {}
             }
             assert!(

@@ -1619,9 +1619,14 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
     }
     let session_source: Arc<std::sync::OnceLock<Arc<signal_handler::SignalRegistry>>> =
         Arc::new(std::sync::OnceLock::new());
+    // The edge's peer ids, learned from each `hello_ack`. Shared by the
+    // coord connection (writes), the forwarder (keeps the edge's
+    // `X-Forwarded-For`) and the iroh registry (flags edge sessions).
+    let edge_peers = p2claw_agent::remote_addr::EdgePeers::default();
     // The iroh registry has no construction-order constraint, so it
     // is built and wired up front; the listener task receives a clone.
-    let iroh_sessions = p2claw_agent::iroh_listener::IrohSessionRegistry::new();
+    let iroh_sessions =
+        p2claw_agent::iroh_listener::IrohSessionRegistry::with_edge_peers(edge_peers.clone());
     let iroh_session_source: Arc<
         std::sync::OnceLock<Arc<p2claw_agent::iroh_listener::IrohSessionRegistry>>,
     > = Arc::new(std::sync::OnceLock::new());
@@ -1682,7 +1687,8 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
         Some(oauth_validator),
         Some(Arc::clone(&identity)),
         Some(shares.clone()),
-    );
+    )
+    .with_edge_peers(edge_peers.clone());
 
     // ---------- Supervised auxiliary subtasks --------------------
     //
@@ -1839,16 +1845,20 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
                 };
                 // Per-connection handlers: the authenticated remote
                 // peer id is bound into the Forwarder so private
-                // routes can check shares and attribute the caller.
-                let make_session = move |remote: iroh::EndpointId| {
-                    let peer_forwarder = forwarder.for_peer(remote.to_z32());
+                // routes can check shares and attribute the caller,
+                // and the connection itself so each request's
+                // `X-Forwarded-For` is its current remote address.
+                let make_session = move |conn: &iroh::endpoint::Connection| {
+                    let peer_forwarder = forwarder
+                        .for_peer(conn.remote_id().to_z32())
+                        .with_remote(std::sync::Arc::new(iroh_listener::IrohRemote(conn.clone())));
                     let ws_handler: std::sync::Arc<dyn p2claw_translator::WsHandler> =
                         std::sync::Arc::new(p2claw_agent::ws_forwarder::WsForwarder::new(
                             peer_forwarder.clone(),
                         ));
                     (peer_forwarder, Some(ws_handler))
                 };
-                if let Err(e) = iroh_listener::serve_endpoint_per_peer(
+                if let Err(e) = iroh_listener::serve_endpoint_per_conn(
                     endpoint,
                     tx,
                     sd,
@@ -2183,6 +2193,7 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
         let coord_health = coord_health_tx.clone();
         let email = email.clone();
         let oauth_grants = Arc::clone(&oauth_grants);
+        let edge_peers = edge_peers.clone();
         async move {
             coord_conn::run(
                 coord_url,
@@ -2200,6 +2211,7 @@ async fn cmd_run(paths: &config::Paths, coord_url: &str, coord_domain: &str) -> 
                 email,
                 email_link_inbox,
                 oauth_grants,
+                edge_peers,
                 coord_health,
             )
             .await

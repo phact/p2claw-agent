@@ -27,6 +27,7 @@ pub mod forwarder;
 mod fs_atomic;
 pub mod oauth;
 pub mod oauth_grants;
+pub mod remote_addr;
 pub mod shares;
 // The haiku-grammar parser lives in `p2claw-iroh-client::url`.
 // One canonical parser; one place to change.

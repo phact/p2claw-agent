@@ -35,6 +35,7 @@ use tracing::{debug, warn};
 use p2claw_iroh_client::url::{P2clawHost, UrlParseError};
 
 use crate::oauth::{middleware as oauth_mw, OAuthValidator};
+use crate::remote_addr::{self, EdgePeers, Remote, RemoteSource};
 use crate::routes::{RouteRecord, RouteTable};
 use crate::shares::{Shares, PEER_HEADER};
 use crate::validate::{resolve_loopback, unix_upstream_path, ValidateError};
@@ -79,6 +80,15 @@ pub struct Forwarder {
     /// private route. Per-connection: lives on the clone, not in the
     /// shared inner state.
     caller_peer: Option<String>,
+    /// Where this connection's requests come from, sampled per
+    /// request to set `X-Forwarded-For` (see [`crate::remote_addr`]).
+    /// `None` when the transport didn't say (tests, the simpler iroh
+    /// entry points): the inbound header is still stripped.
+    remote: Option<Arc<dyn RemoteSource>>,
+    /// The edge's peer ids, filled from coord's `hello_ack`. Shared
+    /// by every clone, so a set learned after a connection opened
+    /// still applies to it.
+    edge_peers: EdgePeers,
 }
 
 struct ForwarderInner {
@@ -154,7 +164,22 @@ impl Forwarder {
                 loopback_cache: std::sync::Mutex::new(HashMap::new()),
             }),
             caller_peer: None,
+            remote: None,
+            edge_peers: EdgePeers::default(),
         }
+    }
+
+    /// Use `edge_peers` (shared with the coord connection, which
+    /// fills it) to recognise the edge. Call before cloning the
+    /// forwarder out to transports.
+    pub fn with_edge_peers(mut self, edge_peers: EdgePeers) -> Self {
+        self.edge_peers = edge_peers;
+        self
+    }
+
+    /// The edge peer set this forwarder consults.
+    pub fn edge_peers(&self) -> &EdgePeers {
+        &self.edge_peers
     }
 
     /// Clone of this forwarder bound to an authenticated caller. The
@@ -163,9 +188,31 @@ impl Forwarder {
     /// attribute every request on that connection.
     pub fn for_peer(&self, peer_z32: String) -> Self {
         Self {
-            inner: Arc::clone(&self.inner),
             caller_peer: Some(peer_z32),
+            ..self.clone()
         }
+    }
+
+    /// Clone of this forwarder that asks `remote` where each request
+    /// came from. The iroh listener binds the connection, the WebRTC
+    /// session its selected candidate pair.
+    pub fn with_remote(&self, remote: Arc<dyn RemoteSource>) -> Self {
+        Self {
+            remote: Some(remote),
+            ..self.clone()
+        }
+    }
+
+    /// Replace the request's `X-Forwarded-For` with the real remote
+    /// address, or mark it relayed ([`crate::remote_addr`]). Run on
+    /// every forwarded request after the inbound `X-P2claw-*` strip.
+    pub(crate) fn set_forwarded_for(&self, headers: &mut Vec<(Bytes, Bytes)>) {
+        let from_edge = self
+            .caller_peer
+            .as_deref()
+            .is_some_and(|p| self.edge_peers.contains(p));
+        let remote = self.remote.as_ref().map_or(Remote::Unknown, |r| r.remote());
+        remote_addr::set_forwarded_for(headers, remote, from_edge);
     }
 
     /// Shared accessors used by [`crate::ws_forwarder::WsForwarder`]
@@ -269,6 +316,9 @@ impl Forwarder {
             .await
             .map_err(ForwardError::Auth)?;
         }
+        // After either gate's `X-P2claw-*` strip, so the relayed
+        // marker it may add can't have been forged.
+        self.set_forwarded_for(&mut req.headers);
 
         let this = self.clone();
         let resp = timeout(FORWARD_TIMEOUT, this.forward_http(route.clone(), req))

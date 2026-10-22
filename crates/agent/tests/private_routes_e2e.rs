@@ -33,12 +33,13 @@ const PARENT_DOMAIN: &str = "p2claw.test";
 const ALIAS: &str = "blue-otter-7392";
 
 /// Hyper handler that echoes the method, path, and every
-/// `x-p2claw-*` header — lets tests assert the strip + inject.
+/// `x-p2claw-*` and `x-forwarded-for` header — lets tests assert
+/// the strip + inject.
 async fn echo(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
     let mut body = format!("method={} path={}\n", req.method(), req.uri().path());
     for (name, value) in req.headers() {
         let n = name.as_str();
-        if n.starts_with("x-p2claw-") {
+        if n.starts_with("x-p2claw-") || n == "x-forwarded-for" {
             body.push_str(&format!("hdr:{n}={}\n", value.to_str().unwrap_or("<bad>")));
         }
     }
@@ -202,12 +203,26 @@ async fn shared_peer_reaches_route_with_stripped_and_injected_headers() {
         .await
         .unwrap();
 
-    let client = spawn_duplex(fx.forwarder().for_peer(caller.clone()));
-    // Spoofed identity header must be stripped before forwarding.
-    let req = private_req("/hello").header(
-        Bytes::from_static(b"x-p2claw-user"),
-        Bytes::from_static(b"mallory@example.com"),
+    let remote = p2claw_agent::remote_addr::SharedRemote::default();
+    remote.set(p2claw_agent::remote_addr::Remote::Direct(Some(
+        "198.51.100.4:4433".parse().unwrap(),
+    )));
+    let client = spawn_duplex(
+        fx.forwarder()
+            .for_peer(caller.clone())
+            .with_remote(Arc::new(remote)),
     );
+    // Spoofed identity header must be stripped before forwarding,
+    // and a forged visitor address replaced by the connection's.
+    let req = private_req("/hello")
+        .header(
+            Bytes::from_static(b"x-p2claw-user"),
+            Bytes::from_static(b"mallory@example.com"),
+        )
+        .header(
+            Bytes::from_static(b"x-forwarded-for"),
+            Bytes::from_static(b"6.6.6.6"),
+        );
     let resp = client.request(req).await.expect("request");
     assert_eq!(resp.status, 200);
     let body = resp.body.collect().await;
@@ -219,6 +234,10 @@ async fn shared_peer_reaches_route_with_stripped_and_injected_headers() {
     assert!(
         !text.contains("x-p2claw-user"),
         "spoofed inbound identity header must be stripped: {text}"
+    );
+    assert!(
+        text.contains("hdr:x-forwarded-for=198.51.100.4\n") && !text.contains("6.6.6.6"),
+        "X-Forwarded-For must be the connection's address: {text}"
     );
 }
 
@@ -478,7 +497,16 @@ async fn ws_upgrade_to_private_route_bridges_with_share() {
         .await
         .unwrap();
 
-    let client = spawn_duplex_with_ws(fx.forwarder().for_peer(caller.clone()));
+    // A peer on the iroh relay: no address to pass along.
+    let remote = p2claw_agent::remote_addr::SharedRemote::default();
+    remote.set(p2claw_agent::remote_addr::Remote::Relayed(
+        p2claw_agent::remote_addr::Relay::Iroh,
+    ));
+    let client = spawn_duplex_with_ws(
+        fx.forwarder()
+            .for_peer(caller.clone())
+            .with_remote(Arc::new(remote)),
+    );
     let conn = tokio::time::timeout(
         Duration::from_secs(5),
         client.open_websocket(private_ws_upgrade()),
@@ -502,6 +530,13 @@ async fn ws_upgrade_to_private_route_bridges_with_share() {
     assert!(
         !headers.iter().any(|(n, _)| n == "x-p2claw-user"),
         "spoofed identity header must be stripped: {headers:?}"
+    );
+    assert!(
+        headers
+            .iter()
+            .any(|(n, v)| n == "x-p2claw-relayed" && v == "iroh-relay")
+            && !headers.iter().any(|(n, _)| n == "x-forwarded-for"),
+        "a relayed peer is marked, with no address: {headers:?}"
     );
 
     // Frames round-trip through the bridge.

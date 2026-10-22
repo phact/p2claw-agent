@@ -29,8 +29,11 @@
 //!   it is connected while coord has already evicted it. Authoritative
 //!   reachability stays coord's/edge's to answer.
 //! - `GET /v1/sessions` → active visitor sessions: id, best-effort
-//!   transport path (direct / relay / unknown), age. Metadata only —
-//!   no visitor IPs (coordination-is-metadata-only).
+//!   transport path (direct / relay / unknown), the remote address
+//!   (the same one forwarded requests carry in `X-Forwarded-For`;
+//!   `null` when relayed, since the address would be the relay's),
+//!   the peer id for iroh, age. Local to the box owner; coordination
+//!   never sees it.
 //! - `POST /v1/routes` → register or replace a route.
 //! - `GET /v1/routes` → list all routes.
 //! - `GET /v1/routes/<name>` → one route.
@@ -492,36 +495,49 @@ async fn status_handler(api: &LocalApi) -> Response<ApiBody> {
     json_response(StatusCode::OK, &body)
 }
 
-/// Active visitor sessions — metadata only, no visitor IPs. Reads the
-/// live signal registry once it has been wired (empty before then).
+/// Active visitor sessions. Reads the live signal registry once it
+/// has been wired (empty before then) and the iroh registry.
 async fn sessions_handler(api: &LocalApi) -> Response<ApiBody> {
-    let mut sessions: Vec<SessionEntry> = match api.sessions.get() {
-        Some(reg) => reg
-            .list_sessions()
-            .await
-            .into_iter()
-            .map(|s| SessionEntry {
-                id: s.id,
-                kind: "browser",
-                transport: s.transport.as_str(),
-                age_secs: s.age_secs,
-            })
-            .collect(),
+    let browser = match api.sessions.get() {
+        Some(reg) => reg.list_sessions().await,
         None => Vec::new(),
     };
-    if let Some(reg) = api.iroh_sessions.get() {
-        sessions.extend(reg.list_sessions().into_iter().map(|s| SessionEntry {
+    let iroh = match api.iroh_sessions.get() {
+        Some(reg) => reg.list_sessions(),
+        None => Vec::new(),
+    };
+    json_response(StatusCode::OK, &sessions_body(browser, iroh))
+}
+
+fn sessions_body(
+    browser: Vec<crate::signal_handler::SessionSnapshot>,
+    iroh: Vec<p2claw_agent::iroh_listener::IrohSessionSnapshot>,
+) -> SessionsBody {
+    let mut sessions: Vec<SessionEntry> = browser
+        .into_iter()
+        .map(|s| SessionEntry {
             id: s.id,
-            kind: "iroh",
-            transport: s.transport.as_str(),
+            kind: "browser",
+            transport: s.remote.transport(),
+            addr: s.remote.addr().map(|a| a.to_string()),
+            peer_id: None,
+            edge: false,
             age_secs: s.age_secs,
-        }));
-    }
-    let body = SessionsBody {
+        })
+        .collect();
+    sessions.extend(iroh.into_iter().map(|s| SessionEntry {
+        id: s.id,
+        kind: "iroh",
+        transport: s.remote.transport(),
+        addr: s.remote.addr().map(|a| a.to_string()),
+        peer_id: Some(s.peer_id),
+        edge: s.edge,
+        age_secs: s.age_secs,
+    }));
+    SessionsBody {
         count: sessions.len(),
         sessions,
-    };
-    json_response(StatusCode::OK, &body)
+    }
 }
 
 async fn list_routes_handler(api: &LocalApi) -> Response<ApiBody> {
@@ -1246,6 +1262,20 @@ struct SessionEntry {
     kind: &'static str,
     /// `direct` / `relay` / `unknown` (best-effort network path).
     transport: &'static str,
+    /// The remote address, `ip:port` (IPv6 in brackets): the same IP
+    /// forwarded requests carry in `X-Forwarded-For`. `null` when the
+    /// path is relayed (the address the box sees is the relay's, not
+    /// the visitor's) or not known yet. For an edge connection it is
+    /// the edge server's; the visitors' addresses ride per request.
+    addr: Option<String>,
+    /// iroh only: the remote endpoint id (z-base-32), the identity
+    /// private-route shares are checked against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_id: Option<String>,
+    /// iroh only, and only when true: the peer is the operator's edge
+    /// (the public HTTPS tunnel, one connection for many visitors).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    edge: bool,
     age_secs: u64,
 }
 
@@ -1675,6 +1705,62 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// The per-session JSON: the remote address when the box sees the
+    /// peer's own, `null` when relayed (never the relay's address),
+    /// and the peer id plus the edge flag for iroh connections only.
+    #[test]
+    fn sessions_body_shape() {
+        use crate::signal_handler::SessionSnapshot;
+        use p2claw_agent::iroh_listener::IrohSessionSnapshot;
+        use p2claw_agent::remote_addr::{Relay, Remote};
+
+        let browser = vec![
+            SessionSnapshot {
+                id: "sess-direct".into(),
+                remote: Remote::Direct(Some("203.0.113.7:51234".parse().unwrap())),
+                age_secs: 5,
+            },
+            SessionSnapshot {
+                id: "sess-turn".into(),
+                remote: Remote::Relayed(Relay::Turn),
+                age_secs: 6,
+            },
+        ];
+        let iroh = vec![
+            IrohSessionSnapshot {
+                id: "iroh-0".into(),
+                remote: Remote::Direct(Some("[2001:db8::7]:4433".parse().unwrap())),
+                peer_id: "peerz32".into(),
+                edge: false,
+                age_secs: 7,
+            },
+            IrohSessionSnapshot {
+                id: "iroh-1".into(),
+                remote: Remote::Relayed(Relay::Iroh),
+                peer_id: "edgez32".into(),
+                edge: true,
+                age_secs: 8,
+            },
+        ];
+        let v = serde_json::to_value(sessions_body(browser, iroh)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "count": 4,
+                "sessions": [
+                    {"id": "sess-direct", "kind": "browser", "transport": "direct",
+                     "addr": "203.0.113.7:51234", "age_secs": 5},
+                    {"id": "sess-turn", "kind": "browser", "transport": "relay",
+                     "addr": null, "age_secs": 6},
+                    {"id": "iroh-0", "kind": "iroh", "transport": "direct",
+                     "addr": "[2001:db8::7]:4433", "peer_id": "peerz32", "age_secs": 7},
+                    {"id": "iroh-1", "kind": "iroh", "transport": "relay",
+                     "addr": null, "peer_id": "edgez32", "edge": true, "age_secs": 8},
+                ]
+            })
+        );
     }
 
     /// An agent process that hasn't yet completed registration

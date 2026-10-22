@@ -9,12 +9,14 @@
 //! native peers.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use p2claw_agent::forwarder::Forwarder;
+use p2claw_agent::remote_addr::{Relay, Remote, SharedRemote};
 use p2claw_control_proto::{SignalEndReason, VisitorKind};
 use p2claw_identity::{sign_dtls_fp, SigningKey};
 use p2claw_wire::{Frame, StreamId};
@@ -34,6 +36,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc::stats::StatsReportType;
 
 const FP_ALG_SHA256: u8 = 0x01;
 
@@ -168,34 +171,14 @@ enum BridgeError {
     Translator(#[from] p2claw_translator::TranslatorError),
 }
 
-/// Transport path a visitor's WebRTC session settled on. Best-effort:
-/// read from the selected ICE candidate pair when the data channel
-/// opens. `Unknown` until then — and if the pair can't be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionTransport {
-    Unknown,
-    /// Peer-to-peer (host / server-reflexive candidate pair).
-    Direct,
-    /// TURN-relayed (at least one endpoint is a relay candidate).
-    Relay,
-}
-
-impl SessionTransport {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SessionTransport::Unknown => "unknown",
-            SessionTransport::Direct => "direct",
-            SessionTransport::Relay => "relay",
-        }
-    }
-}
-
 /// One active visitor session, as reported by `GET /v1/sessions`.
-/// Metadata only — no visitor IPs (coordination-is-metadata-only).
+/// The remote is what the selected ICE candidate pair says: the
+/// visitor's address when direct, only "relayed" on TURN (the
+/// address would be the TURN server's).
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub id: String,
-    pub transport: SessionTransport,
+    pub remote: Remote,
     pub age_secs: u64,
 }
 
@@ -203,10 +186,11 @@ struct SessionHandle {
     inbound_tx: mpsc::Sender<SessionInbound>,
     /// When `signal_push` created this session — powers `age_secs`.
     started_at: Instant,
-    /// Filled in when the data channel opens (see `detect_transport`).
-    /// Shared with the session task so the snapshot reflects the live
-    /// value without threading it back through the registry.
-    transport: Arc<std::sync::Mutex<SessionTransport>>,
+    /// Filled in when ICE selects a pair and when the data channel
+    /// opens (see `detect_remote`). Shared with the session task and
+    /// its forwarder, so the snapshot and `X-Forwarded-For` reflect
+    /// the live value without threading it back through the registry.
+    remote: SharedRemote,
 }
 
 /// Live signaling sessions, indexed by `session_id`. The control loop
@@ -269,7 +253,7 @@ impl SignalRegistry {
         }
 
         let (inbound_tx, inbound_rx) = mpsc::channel::<SessionInbound>(INBOUND_CAP);
-        let transport = Arc::new(std::sync::Mutex::new(SessionTransport::Unknown));
+        let remote = SharedRemote::default();
         {
             let mut sessions = self.sessions.lock().await;
             if sessions.contains_key(&session_id) {
@@ -281,7 +265,7 @@ impl SignalRegistry {
                 SessionHandle {
                     inbound_tx,
                     started_at: Instant::now(),
-                    transport: Arc::clone(&transport),
+                    remote: remote.clone(),
                 },
             );
         }
@@ -296,7 +280,7 @@ impl SignalRegistry {
                 Arc::clone(&registry.identity),
                 registry.stun_url.clone(),
                 registry.handler.clone(),
-                transport,
+                remote,
             )
             .await;
             match outcome {
@@ -326,7 +310,7 @@ impl SignalRegistry {
     }
 
     /// Snapshot of the live visitor sessions for `GET /v1/sessions`.
-    /// Metadata only: id, best-effort transport path, and age.
+    /// Id, best-effort path and remote address, and age.
     pub async fn list_sessions(&self) -> Vec<SessionSnapshot> {
         let now = Instant::now();
         let sessions = self.sessions.lock().await;
@@ -334,7 +318,7 @@ impl SignalRegistry {
             .iter()
             .map(|(id, h)| SessionSnapshot {
                 id: id.clone(),
-                transport: *h.transport.lock().expect("transport mutex poisoned"),
+                remote: h.remote.get(),
                 age_secs: now.saturating_duration_since(h.started_at).as_secs(),
             })
             .collect()
@@ -407,7 +391,7 @@ async fn run_session(
     identity: Arc<SigningKey>,
     stun_url: Option<String>,
     handler: Forwarder,
-    transport: Arc<std::sync::Mutex<SessionTransport>>,
+    remote: SharedRemote,
 ) -> Result<SignalEndReason, SessionError> {
     info!(%session_id, "signal: session opening");
 
@@ -420,7 +404,7 @@ async fn run_session(
         outbound_tx,
         identity,
         handler,
-        transport,
+        remote,
     )
     .await;
 
@@ -438,29 +422,69 @@ async fn run_session(
     result
 }
 
-#[allow(clippy::too_many_arguments)] // single caller; args are conceptually distinct.
-/// Best-effort read of the selected ICE candidate pair's path type.
-/// webrtc-rs 0.13 exposes the pair only through its `Display` impl
-/// (the candidate fields are private), which renders each endpoint as
-/// `"<proto> <typ> <addr>"`; a `relay` typ on either endpoint means
-/// the visitor is on a TURN fallback. Returns `Unknown` if no pair is
-/// selected yet. Never fails — status/observability must not perturb
-/// the data path.
-async fn detect_transport(pc: &Arc<RTCPeerConnection>) -> SessionTransport {
+/// Best-effort read of the selected ICE candidate pair: relayed or
+/// direct, and the visitor's address when direct. webrtc-rs 0.13
+/// exposes the pair only through its `Display` impl (the candidate
+/// fields are private), which renders each endpoint as
+/// `"<proto> <typ> <addr>:<port><related addr>"`; a `relay` typ on
+/// either endpoint means the visitor is on a TURN fallback, and the
+/// remote address is then the TURN server's, so none is kept. The
+/// address is matched against the remote candidates in the stats
+/// report rather than parsed out of the `Display`, where an IPv6
+/// address or an appended related address make it ambiguous.
+/// Returns `Unknown` if no pair is selected yet. Never fails —
+/// status/observability must not perturb the data path.
+async fn detect_remote(pc: &RTCPeerConnection) -> Remote {
     let dtls = pc.sctp().transport();
     let ice = dtls.ice_transport();
-    match ice.get_selected_candidate_pair().await {
-        Some(pair) => {
-            if pair.to_string().contains(" relay ") {
-                SessionTransport::Relay
-            } else {
-                SessionTransport::Direct
-            }
-        }
-        None => SessionTransport::Unknown,
+    let Some(pair) = ice.get_selected_candidate_pair().await else {
+        return Remote::Unknown;
+    };
+    let pair = pair.to_string();
+    if pair.contains(" relay ") {
+        return Remote::Relayed(Relay::Turn);
     }
+    let stats = pc.get_stats().await;
+    let remotes: Vec<(String, u16)> = stats
+        .reports
+        .into_values()
+        .filter_map(|r| match r {
+            StatsReportType::RemoteCandidate(c) => Some((c.ip, c.port)),
+            _ => None,
+        })
+        .collect();
+    Remote::Direct(selected_remote_addr(&pair, &remotes))
 }
 
+/// The remote endpoint of a selected pair's `Display`, as one of the
+/// known remote candidates (`(ip, port)`). `None` when no candidate
+/// matches or its address isn't an IP (an unresolved mDNS name).
+fn selected_remote_addr(pair: &str, remotes: &[(String, u16)]) -> Option<SocketAddr> {
+    let (_, remote) = pair.split_once("(remote) ")?;
+    // "<proto> <typ> <addr>:<port><related addr>"
+    let endpoint = remote.splitn(3, ' ').nth(2)?;
+    remotes
+        .iter()
+        .filter_map(|(ip, port)| {
+            let rest = endpoint.strip_prefix(&format!("{ip}:{port}"))?;
+            // What follows the port is the related address, if any;
+            // this rules out most ports that are merely a prefix of
+            // the real one.
+            if !rest.is_empty() && rest.parse::<IpAddr>().is_err() {
+                return None;
+            }
+            Some((rest.len(), SocketAddr::new(ip.parse().ok()?, *port)))
+        })
+        // Two candidates on the same IP whose ports are prefixes of
+        // each other can both fit when a related address follows
+        // (`:567` + `80.0.0.0` vs `:5678` + `0.0.0.0`). Take the
+        // longest match; the IP, which is what `X-Forwarded-For`
+        // carries, is the same either way.
+        .min_by_key(|(rest_len, _)| *rest_len)
+        .map(|(_, addr)| addr)
+}
+
+#[allow(clippy::too_many_arguments)] // single caller; args are conceptually distinct.
 async fn run_session_after_build(
     pc: &Arc<RTCPeerConnection>,
     session_id: String,
@@ -468,8 +492,30 @@ async fn run_session_after_build(
     outbound_tx: mpsc::Sender<OutboundSignal>,
     identity: Arc<SigningKey>,
     handler: Forwarder,
-    transport: Arc<std::sync::Mutex<SessionTransport>>,
+    remote: SharedRemote,
 ) -> Result<SignalEndReason, SessionError> {
+    // Requests on this session carry its remote in `X-Forwarded-For`.
+    let handler = handler.with_remote(Arc::new(remote.clone()));
+    // Re-read the remote whenever ICE selects a (new) pair: a relay
+    // pair can be upgraded once a direct path is found. Weak, so the
+    // handler stored on the PC doesn't keep the PC alive.
+    {
+        let pc_weak = Arc::downgrade(pc);
+        let remote = remote.clone();
+        pc.sctp()
+            .transport()
+            .ice_transport()
+            .on_selected_candidate_pair_change(Box::new(move |_pair| {
+                let pc_weak = pc_weak.clone();
+                let remote = remote.clone();
+                Box::pin(async move {
+                    if let Some(pc) = pc_weak.upgrade() {
+                        remote.set(detect_remote(&pc).await);
+                    }
+                })
+            }));
+    }
+
     // Box-initiated channel; browser side learns about it via
     // `ondatachannel` when our offer arrives.
     let dc_init = RTCDataChannelInit {
@@ -697,8 +743,9 @@ async fn run_session_after_build(
             opened = dc_open_rx.recv(), if bridge_handle.is_none() => {
                 if opened.is_none() { continue; }
                 // DC open means ICE has a selected pair; classify the
-                // transport path for `GET /v1/sessions` (best-effort).
-                *transport.lock().expect("transport mutex poisoned") = detect_transport(pc).await;
+                // path for `GET /v1/sessions` and `X-Forwarded-For`
+                // (best-effort) before the first request can arrive.
+                remote.set(detect_remote(pc).await);
                 let dc = Arc::clone(&dc);
                 let sid = session_id.clone();
                 let h = handler.clone();
@@ -1457,6 +1504,64 @@ mod tests {
         assert!(matches!(err, SessionError::NoFingerprint), "{err:?}");
     }
 
+    fn cands(list: &[(&str, u16)]) -> Vec<(String, u16)> {
+        list.iter().map(|(ip, p)| (ip.to_string(), *p)).collect()
+    }
+
+    /// The selected pair's remote endpoint, in webrtc-rs 0.13's
+    /// `Display` shape, resolves to the matching remote candidate.
+    #[test]
+    fn selected_remote_addr_matches_the_remote_candidate() {
+        let pair = "(local) udp host 192.168.1.5:50000 <-> (remote) udp prflx 203.0.113.7:51234";
+        let remotes = cands(&[("10.0.0.9", 9), ("203.0.113.7", 51234)]);
+        assert_eq!(
+            selected_remote_addr(pair, &remotes),
+            Some("203.0.113.7:51234".parse().unwrap())
+        );
+        // The local side never matches, even when it's a candidate
+        // address too.
+        assert_eq!(
+            selected_remote_addr(pair, &cands(&[("192.168.1.5", 50000)])),
+            None
+        );
+    }
+
+    /// The related address is appended straight after the port, so a
+    /// shorter port can be a prefix of the real one; only a match
+    /// followed by nothing or an IP counts, the longest one when both
+    /// fit. IPv6 has no brackets.
+    #[test]
+    fn selected_remote_addr_related_address_and_ipv6() {
+        let pair =
+            "(local) udp host 192.168.1.5:50000 <-> (remote) udp srflx 198.51.100.4:56780.0.0.0";
+        // `:56` leaves `780.0.0.0`, not an IP: never a match.
+        let remotes = cands(&[("198.51.100.4", 56)]);
+        assert_eq!(selected_remote_addr(pair, &remotes), None);
+        // `:567` + `80.0.0.0` and `:5678` + `0.0.0.0` both fit.
+        let remotes = cands(&[("198.51.100.4", 567), ("198.51.100.4", 5678)]);
+        assert_eq!(
+            selected_remote_addr(pair, &remotes),
+            Some("198.51.100.4:5678".parse().unwrap())
+        );
+
+        let pair = "(local) udp host [::1]:1 <-> (remote) udp host 2001:db8::7:4433";
+        assert_eq!(
+            selected_remote_addr(pair, &cands(&[("2001:db8::7", 4433)])),
+            Some("[2001:db8::7]:4433".parse().unwrap())
+        );
+    }
+
+    /// An unresolved mDNS name or no matching candidate: no address.
+    #[test]
+    fn selected_remote_addr_none_when_not_an_ip() {
+        let pair = "(local) udp host 192.168.1.5:50000 <-> (remote) udp host abc.local:5000";
+        assert_eq!(
+            selected_remote_addr(pair, &cands(&[("abc.local", 5000)])),
+            None
+        );
+        assert_eq!(selected_remote_addr(pair, &[]), None);
+    }
+
     #[test]
     fn payload_offer_roundtrip_json() {
         let p = SignalPayload {
@@ -1827,6 +1932,20 @@ mod tests {
             "body should mention the missing Host header: {resp_str}"
         );
 
+        // The session reports the browser's side of the selected pair:
+        // host candidates on this machine, so a direct path with an
+        // address.
+        let sessions = registry.list_sessions().await;
+        let s = sessions
+            .iter()
+            .find(|s| s.id == session_id)
+            .expect("session listed");
+        assert!(
+            matches!(s.remote, Remote::Direct(Some(_))),
+            "expected a direct remote with an address: {:?}",
+            s.remote
+        );
+
         registry
             .on_end(&session_id, SignalEndReason::Connected)
             .await;
@@ -2137,7 +2256,7 @@ mod tests {
                 SessionHandle {
                     inbound_tx,
                     started_at: Instant::now(),
-                    transport: Arc::new(std::sync::Mutex::new(SessionTransport::Unknown)),
+                    remote: SharedRemote::default(),
                 },
             );
         }
@@ -2213,7 +2332,7 @@ mod tests {
                 SessionHandle {
                     inbound_tx,
                     started_at: Instant::now(),
-                    transport: Arc::new(std::sync::Mutex::new(SessionTransport::Unknown)),
+                    remote: SharedRemote::default(),
                 },
             );
         }

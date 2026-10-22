@@ -82,7 +82,18 @@ pub enum Message {
     /// S → C. Coord accepts the hello. No `token_refresh` field
     /// (no token to rotate) and no `heartbeat_interval_s` (QUIC's
     /// idle timeout handles liveness).
-    HelloAck { server_time: u64 },
+    ///
+    /// `edge_peer_ids` are the z-base-32 peer ids of the operator's
+    /// edge (the public HTTPS tunnel). An iroh connection from one of
+    /// them carries many visitors, and its `X-Forwarded-For` comes
+    /// from the edge's front proxy, so the box keeps it instead of
+    /// replacing it with the edge server's address. Empty from a
+    /// coord without a configured edge key (and from older coords).
+    HelloAck {
+        server_time: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        edge_peer_ids: Vec<String>,
+    },
 
     /// C → S. Box's iroh addresses changed.
     AddrsUpdate { iroh_addrs: Vec<String> },
@@ -517,6 +528,7 @@ mod tests {
     fn hello_ack_shape() {
         let env = Envelope::new(Message::HelloAck {
             server_time: 1_767_312_000,
+            edge_peer_ids: Vec::new(),
         });
         let j = env.to_json();
         assert!(!j.contains("token_refresh"), "should omit: {j}");
@@ -524,7 +536,22 @@ mod tests {
             !j.contains("heartbeat_interval_s"),
             "should omit heartbeat_interval_s: {j}"
         );
+        assert!(!j.contains("edge_peer_ids"), "should omit when empty: {j}");
         roundtrip(env);
+        roundtrip(Envelope::new(Message::HelloAck {
+            server_time: 1_767_312_000,
+            edge_peer_ids: vec!["edgepeerz32".into()],
+        }));
+        // An older coord's ack has no list.
+        let old = Envelope::from_json(r#"{"type":"hello_ack","v":1,"server_time":1}"#)
+            .expect("parse old hello_ack");
+        assert_eq!(
+            old.body,
+            Message::HelloAck {
+                server_time: 1,
+                edge_peer_ids: Vec::new(),
+            }
+        );
     }
 
     #[test]

@@ -247,8 +247,14 @@ async fn ws_upgrade_forwards_identity_headers_to_oauth_gated_upstream() {
         .await
         .expect("upsert oauth route");
 
+    // The transport says where the visitor is; the WS dial carries it.
+    let remote = p2claw_agent::remote_addr::SharedRemote::default();
+    remote.set(p2claw_agent::remote_addr::Remote::Direct(Some(
+        "203.0.113.7:51234".parse().unwrap(),
+    )));
     let forwarder =
-        Forwarder::new_with_oauth(routes, PARENT_DOMAIN.into(), Some(Arc::clone(&validator)));
+        Forwarder::new_with_oauth(routes, PARENT_DOMAIN.into(), Some(Arc::clone(&validator)))
+            .with_remote(Arc::new(remote));
     let ws_handler: Arc<dyn WsHandler> = Arc::new(WsForwarder::new(forwarder.clone()));
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -300,6 +306,11 @@ async fn ws_upgrade_forwards_identity_headers_to_oauth_gated_upstream() {
         .header(
             Bytes::from_static(b"x-p2claw-user"),
             Bytes::from_static(b"attacker"),
+        )
+        // Forged visitor address — replaced by the transport's.
+        .header(
+            Bytes::from_static(b"x-forwarded-for"),
+            Bytes::from_static(b"6.6.6.6"),
         );
 
     let ws = tokio::time::timeout(Duration::from_secs(10), client.open_websocket(upgrade))
@@ -392,6 +403,16 @@ async fn ws_upgrade_forwards_identity_headers_to_oauth_gated_upstream() {
             .iter()
             .all(|(n, v)| !(n.eq_ignore_ascii_case("x-p2claw-user") && v == "attacker")),
         "spoofed X-P2claw-User must be stripped, not forwarded; got: {captured:?}",
+    );
+    let xff: Vec<&str> = captured
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("x-forwarded-for"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(
+        xff,
+        vec!["203.0.113.7"],
+        "the WS dial carries the transport's address, not the forged one; got: {captured:?}",
     );
     // WS-handshake mechanics must NOT be forwarded from the visitor —
     // the dialer regenerates Host for the loopback upstream. If the
