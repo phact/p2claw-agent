@@ -859,8 +859,9 @@ struct PeerBody {
 /// `GET /v1/peers/<alias or peer id>`: whether coord knows the peer,
 /// and its peer id (what shares are keyed on). Asked the way a dial
 /// asks (`/v1/connect`, native, no app), so it answers for boxes that
-/// are offline too, and opens no session. 404 `no_such_peer`, 410
-/// `revoked`.
+/// are offline too, and opens no session. An alias answer must carry
+/// a binding signed by the pinned coord root key. 404 `no_such_peer`,
+/// 410 `revoked`, 502 `untrusted_resolution`.
 async fn peer_handler(api: &LocalApi, name: &str) -> Response<ApiBody> {
     let is_peer_id = p2claw_identity::PeerId::from_z32(name).is_ok();
     if !is_peer_id && !p2claw_identity::alias_label::is_valid_alias_label(name) {
@@ -883,16 +884,11 @@ async fn peer_handler(api: &LocalApi, name: &str) -> Response<ApiBody> {
             },
         );
     };
-    let opts = cache.options();
-    let coord = opts
-        .coord_url
-        .clone()
-        .unwrap_or_else(|| p2claw_iroh_client::connect::default_coord_url(&opts.parent_domain));
-    match p2claw_iroh_client::connect::connect(&coord, name, None, opts.timeout).await {
-        Ok(found) => json_response(
+    match p2claw_iroh_client::resolve_peer(name, cache.options()).await {
+        Ok(peer) => json_response(
             StatusCode::OK,
             &PeerBody {
-                peer_id: found.peer_id,
+                peer_id: peer.to_z32(),
                 alias: (!is_peer_id).then(|| name.to_string()),
             },
         ),
@@ -904,6 +900,9 @@ async fn peer_handler(api: &LocalApi, name: &str) -> Response<ApiBody> {
                 p2claw_iroh_client::PeerClientError::PeerRevoked => (StatusCode::GONE, "revoked"),
                 p2claw_iroh_client::PeerClientError::RateLimited(_) => {
                     (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+                }
+                p2claw_iroh_client::PeerClientError::UntrustedResolution(_) => {
+                    (StatusCode::BAD_GATEWAY, "untrusted_resolution")
                 }
                 _ => (StatusCode::BAD_GATEWAY, "coord_error"),
             };
@@ -2674,11 +2673,23 @@ mod tests {
     }
 
     /// `/v1/peers/<name>` asks coord (`/v1/connect`, native) for the
-    /// peer id behind an alias; one coord doesn't know is a 404, and
+    /// peer id behind an alias and checks its signed binding; one
+    /// coord doesn't know is a 404, an unsigned answer is refused, and
     /// garbage never reaches coord.
     #[tokio::test]
     async fn peers_endpoint_looks_up_aliases_with_coord() {
-        let known = SigningKey::generate().peer_id().to_z32();
+        use base64::Engine as _;
+        let root = SigningKey::generate();
+        let known_peer = SigningKey::generate().peer_id();
+        let known = known_peer.to_z32();
+        let sig = p2claw_identity::sign_alias_binding(
+            &root,
+            "devout-chamois-2124",
+            &known_peer,
+            1_700_000_000,
+        )
+        .unwrap();
+        let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
         let coord = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let coord_url = format!("http://{}", coord.local_addr().unwrap());
         let known_cl = known.clone();
@@ -2688,15 +2699,28 @@ mod tests {
                     return;
                 };
                 let known = known_cl.clone();
+                let sig_b64 = sig_b64.clone();
                 tokio::spawn(async move {
                     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
                         let known = known.clone();
+                        let sig_b64 = sig_b64.clone();
                         async move {
                             let body = req.into_body().collect().await.unwrap().to_bytes();
                             let asked: serde_json::Value = serde_json::from_slice(&body).unwrap();
                             let (status, out) = if asked["alias"] == "devout-chamois-2124" {
                                 assert_eq!(asked["visitor_kind"], "native");
                                 assert!(asked.get("app").is_none(), "no app: no app gate");
+                                (
+                                    200,
+                                    serde_json::json!({
+                                        "peer_id": known,
+                                        "iroh_node_id": known,
+                                        "alias": "devout-chamois-2124",
+                                        "binding_sig_b64url": sig_b64,
+                                        "binding_issued_at": 1_700_000_000u64,
+                                    }),
+                                )
+                            } else if asked["alias"] == "sly-heron-3141" {
                                 (
                                     200,
                                     serde_json::json!({"peer_id": known, "iroh_node_id": known}),
@@ -2726,7 +2750,7 @@ mod tests {
                 timeout: Duration::from_secs(5),
                 endpoint: None,
                 relay_url: None,
-                coord_root: Some(SigningKey::generate().peer_id()),
+                coord_root: Some(root.peer_id()),
             };
             let _ = api.peer_proxy.set(Arc::new(PeerClientCache::new(opts)));
             let get = |path: &str| {
@@ -2737,6 +2761,12 @@ mod tests {
             assert!(text.contains("200"), "{text}");
             assert!(text.contains(&format!("\"peer_id\":\"{known}\"")), "{text}");
             assert!(text.contains("\"alias\":\"devout-chamois-2124\""), "{text}");
+
+            let text = http_over_uds(&sock, get("/v1/peers/sly-heron-3141").as_bytes()).await;
+            assert!(
+                text.contains("502") && text.contains("\"untrusted_resolution\""),
+                "{text}"
+            );
 
             let text = http_over_uds(&sock, get("/v1/peers/wise-toad-8257").as_bytes()).await;
             assert!(

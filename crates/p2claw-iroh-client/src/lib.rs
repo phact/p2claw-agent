@@ -195,6 +195,45 @@ impl Default for ClientOptions {
     }
 }
 
+/// Look up the peer behind `name` (an alias or a peer id) with
+/// coordination. An alias answer must carry a binding signed by the
+/// coordination root key in `opts`.
+pub async fn resolve_peer(name: &str, opts: &ClientOptions) -> Result<PeerId, PeerClientError> {
+    resolve_verified(opts, name, None)
+        .await
+        .map(|(_, peer)| peer)
+}
+
+/// `POST /v1/connect` for `target`, then verify the answer. Iroh's
+/// handshake authenticates whatever node id we dial, so that node id
+/// must be one the root key vouches for.
+async fn resolve_verified(
+    opts: &ClientOptions,
+    target: &str,
+    app: Option<&str>,
+) -> Result<(connect::NativeConnectResponse, PeerId), PeerClientError> {
+    let coord_url = opts
+        .coord_url
+        .clone()
+        .unwrap_or_else(|| connect::default_coord_url(&opts.parent_domain));
+    let coord_root = match opts.coord_root {
+        Some(k) => k,
+        None if coord_url == connect::default_coord_url(DEFAULT_PARENT_DOMAIN) => {
+            p2claw_identity::p2claw_coord_root()
+        }
+        None => return Err(PeerClientError::NoCoordRoot(coord_url)),
+    };
+    let timeout = opts.timeout;
+    let resp = tokio::time::timeout(timeout, connect::connect(&coord_url, target, app, timeout))
+        .await
+        .map_err(|_| PeerClientError::Timeout {
+            secs: timeout.as_secs(),
+        })??;
+    tracing::debug!(peer = %resp.peer_id, "coord resolved peer_id");
+    let peer_id = connect::verify_response(&coord_root, target, &resp)?;
+    Ok((resp, peer_id))
+}
+
 impl PeerClient {
     /// Convenience: connect using the default [`ClientOptions`].
     ///
@@ -223,38 +262,9 @@ impl PeerClient {
         };
         let parsed = P2clawUrl::parse(&normalised, &opts.parent_domain)?;
 
-        let coord_url = opts
-            .coord_url
-            .clone()
-            .unwrap_or_else(|| connect::default_coord_url(&opts.parent_domain));
-        let coord_root = match opts.coord_root {
-            Some(k) => k,
-            None if coord_url == connect::default_coord_url(DEFAULT_PARENT_DOMAIN) => {
-                p2claw_identity::p2claw_coord_root()
-            }
-            None => return Err(PeerClientError::NoCoordRoot(coord_url)),
-        };
-
+        let (resp, peer_id) =
+            resolve_verified(&opts, &parsed.alias_label, parsed.app.as_deref()).await?;
         let timeout = opts.timeout;
-        let resp = tokio::time::timeout(
-            timeout,
-            connect::connect(
-                &coord_url,
-                &parsed.alias_label,
-                parsed.app.as_deref(),
-                timeout,
-            ),
-        )
-        .await
-        .map_err(|_| PeerClientError::Timeout {
-            secs: timeout.as_secs(),
-        })??;
-
-        tracing::debug!(peer = %resp.peer_id, "coord resolved peer_id");
-
-        // Iroh's handshake authenticates whatever node id we dial, so
-        // the node id itself must be one the root key vouches for.
-        let peer_id = connect::verify_response(&coord_root, &parsed.alias_label, &resp)?;
 
         let endpoint_addr = transport::endpoint_addr_from_response(&resp)?;
         let endpoint = match opts.endpoint {
