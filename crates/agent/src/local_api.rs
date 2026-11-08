@@ -94,6 +94,9 @@ pub enum LocalApiError {
     Io(#[from] std::io::Error),
     #[error("socket-path error: {0}")]
     Path(String),
+    /// A live agent already answers on the socket.
+    #[error("another p2claw agent is already listening on {0}")]
+    InUse(String),
     /// `accept()` returned EMFILE / ENFILE (process or system FD
     /// limit hit). Surfaced separately so `main.rs` can fail-fast
     /// the whole agent process — restarting just the local API
@@ -226,6 +229,12 @@ impl LocalApi {
     }
 }
 
+/// Whether something accepts connections on the socket at `path`.
+/// A socket file left by an agent that exited refuses connections.
+pub fn socket_is_live(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
 /// Run the local API until `shutdown` flips to `true`. Binds the Unix
 /// socket at `sock_path` (its parent directory is created with
 /// mode `0700` and verified to be owned by the current user).
@@ -238,6 +247,12 @@ pub async fn serve(
 
     prepare_socket_dir(sock_path)?;
     if sock_path.exists() {
+        if socket_is_live(sock_path) {
+            // Another agent is answering here. Replacing its socket
+            // would cut its CLI off, and ours would be deleted when we
+            // exit.
+            return Err(LocalApiError::InUse(sock_path.display().to_string()));
+        }
         // Stale socket from a previous run.
         std::fs::remove_file(sock_path)?;
     }

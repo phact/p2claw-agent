@@ -37,6 +37,11 @@ impl Paths {
     pub fn agent_sock(&self) -> PathBuf {
         self.runtime_dir.join("agent.sock")
     }
+
+    /// Held by the running agent; see `instance_lock`.
+    pub fn agent_lock(&self) -> PathBuf {
+        self.data_dir.join("agent.lock")
+    }
 }
 
 /// Resolve paths from the environment. Allows per-field overrides

@@ -125,8 +125,9 @@ tar = { version = "0.4" }
 flate2 = { version = "1" }
 
 # `Uid::current()`; the SO_PEERCRED check itself goes through
-# `tokio::net::UnixStream::peer_cred`.
-nix = { version = "0.29", default-features = false, features = ["user"] }
+# `tokio::net::UnixStream::peer_cred`. `fs` for the `flock` in
+# `instance_lock`.
+nix = { version = "0.29", default-features = false, features = ["user", "fs"] }
 
 # EdDSA verification of the OAuth broker's ID-JWT (`oauth::jwt`).
 # v2 matches iroh's transitive choice so the graph keeps one copy.

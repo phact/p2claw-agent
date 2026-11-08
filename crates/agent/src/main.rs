@@ -36,6 +36,7 @@ mod connect;
 mod coord_conn;
 mod email_link;
 mod fd_count;
+mod instance_lock;
 use p2claw_agent::iroh_listener;
 #[cfg(target_os = "linux")]
 mod linux_install;
@@ -130,9 +131,10 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Run the agent in the foreground (default). Does registration
-    /// on first start, holds the control connection, serves the
-    /// local API.
+    /// Run the agent in the foreground. Does registration on first
+    /// start, holds the control connection, serves the local API.
+    /// Refuses if an agent is already running. (Bare `p2claw` doesn't
+    /// start one: it shows the running agent's status, or this help.)
     Run,
     /// Print the current peer_id and, if registered, the assigned
     /// alias. Does not talk to the network.
@@ -758,7 +760,7 @@ enum ServiceCmd {
 fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
-    let cmd = cli.command.unwrap_or(Cmd::Run);
+    let cmd = cli.command;
 
     let paths = match config::resolve() {
         Ok(p) => p,
@@ -795,6 +797,9 @@ fn main() -> ExitCode {
     };
 
     runtime.block_on(async move {
+        let Some(cmd) = cmd else {
+            return cmd_bare(&paths).await;
+        };
         match cmd {
             Cmd::Identity => cmd_identity(&paths).await,
             Cmd::Status { json } => cli_client::cmd_status(json).await,
@@ -1487,6 +1492,35 @@ fn oauth_broker_url() -> String {
         .unwrap_or_else(|| p2claw_agent::oauth::DEFAULT_BROKER_URL.to_string())
 }
 
+/// Bare `p2claw`. Never starts an agent: a second agent beside a
+/// running one would take over its identity and socket. Shows the
+/// running agent's status, or help and how to start one.
+async fn cmd_bare(paths: &config::Paths) -> ExitCode {
+    let sock = paths.agent_sock();
+    if local_api::socket_is_live(&sock) {
+        let code = cli_client::cmd_status(false).await;
+        println!("\n`p2claw --help` lists commands.");
+        return code;
+    }
+    if let Some(pid) = instance_lock::holder(&paths.agent_lock()) {
+        let who = pid.map_or("an agent is running".to_string(), |p| {
+            format!("an agent is running (pid {p})")
+        });
+        eprintln!(
+            "{who}, but its socket at {} is missing, so commands can't reach it. \
+             Restart the agent to bring the socket back.",
+            sock.display()
+        );
+        return ExitCode::from(1);
+    }
+    let _ = <Cli as clap::CommandFactory>::command().print_help();
+    println!(
+        "\nNo agent is running. Start one with `p2claw service install` \
+         (in the background, and at login) or `p2claw run` (in this terminal)."
+    );
+    ExitCode::SUCCESS
+}
+
 async fn cmd_run(
     paths: &config::Paths,
     coord_url: &str,
@@ -1501,6 +1535,35 @@ async fn cmd_run(
         }
     };
     info!(peer_id = %sk.peer_id(), "identity loaded");
+
+    // One agent per identity. A second one would fight the first for
+    // the coord connection and take over its local-API socket. Held
+    // until cmd_run returns.
+    let _instance = match instance_lock::try_acquire(&paths.agent_lock()) {
+        Ok(instance_lock::Acquire::Acquired(lock)) => Some(lock),
+        Ok(instance_lock::Acquire::HeldBy(pid)) => {
+            let pid = pid.map_or(String::new(), |p| format!(" (pid {p})"));
+            eprintln!(
+                "error: a p2claw agent is already running{pid}. \
+                 `p2claw status` shows it."
+            );
+            return ExitCode::from(1);
+        }
+        Err(e) => {
+            warn!(error = %e, path = %paths.agent_lock().display(), "could not take the instance lock; starting without it");
+            None
+        }
+    };
+    // Agents from before the lock don't take it, but they do answer
+    // on the socket.
+    if local_api::socket_is_live(&paths.agent_sock()) {
+        eprintln!(
+            "error: a p2claw agent is already listening on {}. \
+             `p2claw status` shows it.",
+            paths.agent_sock().display()
+        );
+        return ExitCode::from(1);
+    }
 
     // Priv-drop happens later, after `local_ca::load_or_generate`
     // (root reads the on-disk key into memory) and after the SNI
