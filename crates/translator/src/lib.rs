@@ -220,6 +220,26 @@ pub struct ServerWsUpgrade {
     pub headers: Vec<(Bytes, Bytes)>,
 }
 
+/// Opaque state a [`WsHandler`] passes from `decide` to `run`.
+pub struct WsHandlerState(pub Box<dyn std::any::Any + Send>);
+
+impl WsHandlerState {
+    pub fn new<T: Send + 'static>(value: T) -> Self {
+        Self(Box::new(value))
+    }
+
+    /// The state as a `T`, or `None` if it holds something else.
+    pub fn downcast<T: 'static>(self) -> Option<T> {
+        self.0.downcast::<T>().ok().map(|b| *b)
+    }
+}
+
+impl std::fmt::Debug for WsHandlerState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WsHandlerState(..)")
+    }
+}
+
 /// Handler decision for a WS_UPGRADE: either accept (the handler is
 /// then invoked with a [`WsConnection`] for the lifetime of the
 /// session) or reject with an HTTP-style status. A rejection goes on
@@ -230,14 +250,12 @@ pub enum WsUpgradeDecision {
         /// Headers to send with the WS_ACCEPT (e.g. selected
         /// `Sec-WebSocket-Protocol`).
         headers: Vec<(Bytes, Bytes)>,
-        /// Handler-private payload threaded by the wire from
-        /// [`WsHandler::decide`] through to [`WsHandler::run`].
-        /// the agent's `WsForwarder` uses this to carry the OAuth
-        /// middleware's injected identity headers
-        /// (`X-P2claw-User`, `X-P2claw-Email`, etc.) into the
-        /// upstream WebSocket dial in `run`. The translator wire
-        /// itself never inspects this list.
-        upstream_headers: Vec<(Bytes, Bytes)>,
+        /// Handler-private state handed from [`WsHandler::decide`]
+        /// to [`WsHandler::run`]. The agent's `WsForwarder` dials the
+        /// upstream in `decide`, so the upstream's chosen subprotocol
+        /// can ride the WS_ACCEPT, and passes the open socket here.
+        /// The wire never looks inside.
+        state: Option<WsHandlerState>,
     },
     Reject {
         status: u16,

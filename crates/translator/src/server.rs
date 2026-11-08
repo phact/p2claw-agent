@@ -17,7 +17,7 @@ use crate::body::{IncomingBody, OutgoingBody};
 use crate::codec_io::FrameCodec;
 use crate::error::TranslatorError;
 use crate::ws::{WsConnection, WsInboundEvent};
-use crate::{ServerRequest, ServerResponse, ServerWsUpgrade, WsUpgradeDecision};
+use crate::{ServerRequest, ServerResponse, ServerWsUpgrade, WsHandlerState, WsUpgradeDecision};
 
 /// A request handler. One invocation per inbound REQ; runs to
 /// completion (response sent) for each stream.
@@ -39,21 +39,15 @@ where
 ///
 /// `decide` is called with the upgrade request's path + headers; it
 /// returns either an [`WsUpgradeDecision::Accept`] (in which case
-/// `serve` invokes [`WsHandler::run`] with the original upgrade,
-/// the decision's `upstream_headers` payload, plus a
-/// [`WsConnection`]) or a [`WsUpgradeDecision::Reject`] which is
-/// mapped to a `RES`.
+/// `serve` sends WS_ACCEPT with the decision's headers, then invokes
+/// [`WsHandler::run`] with the original upgrade, the decision's
+/// `state`, and a [`WsConnection`]) or a
+/// [`WsUpgradeDecision::Reject`] which is mapped to a `RES`.
 ///
-/// `run` re-receives the upgrade because route resolution / upstream
-/// dial may need the original path + headers — `decide` typically
-/// can't dial yet (an upstream-bound `decide` would delay the
-/// WS_ACCEPT and stall the visitor), so the work happens in `run`.
-///
-/// The wire passes the `upstream_headers` list verbatim from the
-/// decision into `run`. It exists so a handler that runs auth in
-/// `decide` (e.g. the agent's `WsForwarder`) can hand its injected
-/// identity headers to the upstream-dial code in `run` without
-/// needing per-stream side state.
+/// A proxying handler dials its upstream in `decide`, so a refused
+/// dial is a clean rejection and the upstream's chosen
+/// `Sec-WebSocket-Protocol` can go on the WS_ACCEPT, then passes the
+/// open socket to `run` in `state`.
 pub trait WsHandler: Send + Sync + 'static {
     fn decide(
         &self,
@@ -63,7 +57,7 @@ pub trait WsHandler: Send + Sync + 'static {
     fn run(
         &self,
         upgrade: ServerWsUpgrade,
-        upstream_headers: Vec<(Bytes, Bytes)>,
+        state: Option<WsHandlerState>,
         conn: WsConnection,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
@@ -652,7 +646,7 @@ where
                         }
                         WsUpgradeDecision::Accept {
                             headers: accept_headers,
-                            upstream_headers,
+                            state,
                         } => {
                             let (in_tx, in_rx) = mpsc::channel::<WsInboundEvent>(32);
                             let cancel = Arc::new(AtomicBool::new(false));
@@ -690,8 +684,9 @@ where
                                 closed_local: AtomicBool::new(false),
                                 peer_close_code: std::sync::atomic::AtomicU16::new(0),
                                 peer_close_reason: tokio::sync::Mutex::new(Bytes::new()),
+                                accept_headers: Vec::new(),
                             };
-                            ws.run(upgrade, upstream_headers, conn).await;
+                            ws.run(upgrade, state, conn).await;
                             open_for_task.lock().await.remove(&stream_id);
                         }
                     }

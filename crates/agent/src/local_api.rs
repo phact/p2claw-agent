@@ -1159,8 +1159,14 @@ async fn proxy_ws(
         }
     };
 
-    // Far side accepted: upgrade the local connection and bridge.
+    // Far side accepted: upgrade the local connection and bridge,
+    // passing on the subprotocol the far side's app selected.
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(&key);
+    let protocol = ws_conn
+        .accept_headers()
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(b"sec-websocket-protocol"))
+        .and_then(|(_, v)| hyper::header::HeaderValue::from_bytes(v).ok());
     let on_upgrade = hyper::upgrade::on(&mut req);
     tokio::spawn(async move {
         match on_upgrade.await {
@@ -1183,12 +1189,15 @@ async fn proxy_ws(
         }
     });
 
-    Response::builder()
+    let mut resp = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
         .header(hyper::header::CONNECTION, "Upgrade")
         .header(hyper::header::UPGRADE, "websocket")
-        .header(hyper::header::SEC_WEBSOCKET_ACCEPT, accept)
-        .body(full_body(Bytes::new()))
+        .header(hyper::header::SEC_WEBSOCKET_ACCEPT, accept);
+    if let Some(protocol) = protocol {
+        resp = resp.header(hyper::header::SEC_WEBSOCKET_PROTOCOL, protocol);
+    }
+    resp.body(full_body(Bytes::new()))
         .expect("static 101 response builds")
 }
 

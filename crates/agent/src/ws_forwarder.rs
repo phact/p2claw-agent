@@ -21,8 +21,8 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use p2claw_iroh_client::url::P2clawHost;
 use p2claw_translator::{
-    IncomingBody, ServerRequest, ServerWsUpgrade, WsConnection, WsHandler, WsMessage,
-    WsUpgradeDecision,
+    IncomingBody, ServerRequest, ServerWsUpgrade, WsConnection, WsHandler, WsHandlerState,
+    WsMessage, WsUpgradeDecision,
 };
 use p2claw_wire::WsOpcode;
 use tokio::sync::Mutex;
@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 use crate::forwarder::Forwarder;
 use crate::oauth::middleware as oauth_mw;
 use crate::oauth::IDENTITY_HEADER_PREFIX;
+use crate::routes::RouteRecord;
 use crate::shares::PEER_HEADER;
 use crate::validate::unix_upstream_path;
 
@@ -60,11 +61,11 @@ impl WsHandler for WsForwarder {
         &self,
         upgrade: &ServerWsUpgrade,
     ) -> Pin<Box<dyn Future<Output = WsUpgradeDecision> + Send + '_>> {
-        // Validate everything that can fail synchronously here so the
-        // wire surfaces `Reject` (→ HTTP-style RES) instead of an
-        // `Accept` followed by an immediate WS_CLOSE. Upstream dial
-        // stays in `run` — that's the only slow step, and stalling
-        // here would delay the visitor's 101.
+        // Validate the route and auth, then dial the upstream, all
+        // before answering: a failure is a `Reject` (→ HTTP-style RES)
+        // rather than an `Accept` followed by an immediate WS_CLOSE,
+        // and the upstream's chosen `Sec-WebSocket-Protocol` goes on
+        // the WS_ACCEPT.
         let forwarder = self.forwarder.clone();
         let upgrade_headers = upgrade.headers.clone();
         let upgrade_path = upgrade.path.clone();
@@ -73,19 +74,29 @@ impl WsHandler for WsForwarder {
 
     fn run(
         &self,
-        upgrade: ServerWsUpgrade,
-        upstream_headers: Vec<(Bytes, Bytes)>,
+        _upgrade: ServerWsUpgrade,
+        state: Option<WsHandlerState>,
         conn: WsConnection,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let forwarder = self.forwarder.clone();
-        Box::pin(async move { run_session(forwarder, upgrade, upstream_headers, conn).await })
+        Box::pin(async move {
+            match state.and_then(WsHandlerState::downcast::<UpstreamWs>) {
+                Some(UpstreamWs::Tcp(ws)) => bridge_session(ws, conn).await,
+                Some(UpstreamWs::Unix(ws)) => bridge_session(ws, conn).await,
+                None => {
+                    warn!("ws: accepted without an upstream socket");
+                    let _ = conn
+                        .close(WS_CLOSE_INTERNAL_ERROR, Bytes::from_static(b"no upstream"))
+                        .await;
+                }
+            }
+        })
     }
 }
 
-/// Validate route + auth before WS_ACCEPT lands. Returns `Reject`
-/// (mapped by the wire to a status-carrying RES) on any failure so
-/// the visitor side sees a clean rejection rather than a 101 +
-/// immediate close.
+/// Validate route + auth and dial the upstream before WS_ACCEPT
+/// lands. Returns `Reject` (mapped by the wire to a status-carrying
+/// RES) on any failure so the visitor side sees a clean rejection
+/// rather than a 101 + immediate close.
 async fn decide_session(
     forwarder: &Forwarder,
     path: Bytes,
@@ -165,10 +176,7 @@ async fn decide_session(
             Bytes::from(peer.into_bytes()),
         ));
         forwarder.set_forwarded_for(&mut upstream_headers);
-        return WsUpgradeDecision::Accept {
-            headers: Vec::new(),
-            upstream_headers,
-        };
+        return dial_and_accept(&route, &path, &upstream_headers).await;
     }
 
     // ---- Auth gate --------------------------------------------------
@@ -218,154 +226,124 @@ async fn decide_session(
     // Same `X-Forwarded-For` rule as the plain-HTTP path.
     forwarder.set_forwarded_for(&mut upstream_headers);
 
-    WsUpgradeDecision::Accept {
-        headers: Vec::new(),
-        upstream_headers,
-    }
+    dial_and_accept(&route, &auth_req.path, &upstream_headers).await
 }
 
-async fn run_session(
-    forwarder: Forwarder,
-    upgrade: ServerWsUpgrade,
-    upstream_headers: Vec<(Bytes, Bytes)>,
-    conn: WsConnection,
-) {
-    // Re-resolve the route to recover the upstream URL. `decide`
-    // already validated everything; this lookup costs one
-    // HashMap-get under a Mutex. Keeping the two halves stateless
-    // avoids interior state and per-stream maps.
-    let host = match take_header(&upgrade.headers, b"host") {
-        Some(h) => h.to_vec(),
-        None => return,
-    };
-    let host_str = match std::str::from_utf8(&host) {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    let parsed = match P2clawHost::parse(strip_port(host_str), forwarder.parent_domain()) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let Some(app) = parsed.app else {
-        return;
-    };
-    let Some(route) = forwarder.routes().get(&app).await else {
-        return;
-    };
+/// The dialed upstream, handed from `decide` to `run`. It's moved
+/// once, already boxed inside `WsHandlerState`, so the variants'
+/// size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
+enum UpstreamWs {
+    Tcp(
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ),
+    Unix(tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>),
+}
 
-    // ---- Upstream dial ------------------------------------------
-    let upstream_url = route.upstream_url();
-
-    // Private routes may hand off over a Unix socket; the WS
-    // handshake then runs over the UnixStream instead of a fresh
-    // TCP dial.
-    if let Some(sock) = unix_upstream_path(upstream_url).map(str::to_string) {
-        // Require origin-form (leading '/'): the path is spliced into
-        // a URL, and a wire-controlled value like `@evil.com/x` would
-        // otherwise reshape the authority component.
-        let path_str = match std::str::from_utf8(&upgrade.path) {
-            Ok(s) if s.starts_with('/') => s.to_string(),
-            _ => "/".to_string(),
-        };
-        let ws_url = format!("ws://localhost{path_str}");
-        let Some(upstream_req) = build_upstream_request(&ws_url, &upstream_headers, &conn).await
-        else {
-            return;
-        };
-        let stream = match tokio::net::UnixStream::connect(&sock).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(error = %e, upstream = %sock, "ws: unix upstream dial failed");
-                let _ = conn
-                    .close(
-                        WS_CLOSE_BAD_GATEWAY,
-                        Bytes::from_static(b"upstream dial failed"),
-                    )
-                    .await;
-                return;
-            }
-        };
-        let (upstream_ws, _resp) = match tokio_tungstenite::client_async(upstream_req, stream).await
-        {
-            Ok(ok) => ok,
-            Err(e) => {
-                warn!(error = %e, upstream = %sock, "ws: unix upstream handshake failed");
-                let _ = conn
-                    .close(
-                        WS_CLOSE_BAD_GATEWAY,
-                        Bytes::from_static(b"upstream dial failed"),
-                    )
-                    .await;
-                return;
-            }
-        };
-        info!(app = %route.name, upstream = %sock, "ws: bridging to unix upstream");
-        bridge_session(upstream_ws, conn).await;
-        return;
-    }
-
-    let host = match upstream_url.host_str() {
-        Some(h) => h.to_string(),
-        None => {
-            warn!(route = %route.name, "ws: route upstream has no host");
-            let _ = conn
-                .close(WS_CLOSE_BAD_GATEWAY, Bytes::from_static(b"bad upstream"))
-                .await;
-            return;
-        }
-    };
-    let port =
-        upstream_url
-            .port_or_known_default()
-            .unwrap_or(if upstream_url.scheme() == "https" {
-                443
-            } else {
-                80
-            });
+/// Dial the route's upstream and accept with the subprotocol it
+/// selected, or reject with 502 if it can't be reached or refuses.
+async fn dial_and_accept(
+    route: &RouteRecord,
+    path: &[u8],
+    upstream_headers: &[(Bytes, Bytes)],
+) -> WsUpgradeDecision {
     // Require origin-form (leading '/'). Without this, a wire-
     // controlled path like `@evil.com/x` spliced into
     // `ws://{host}:{port}{path}` reshapes the authority and makes the
     // BOX dial an arbitrary external host on a peer's behalf.
-    let path_str = match std::str::from_utf8(&upgrade.path) {
+    let path_str = match std::str::from_utf8(path) {
         Ok(s) if s.starts_with('/') => s,
         _ => "/",
     };
-    // Plain `ws://`; the local CA only fronts the SNI listener path,
-    // and the upstream is always a loopback app speaking ws/wss
-    // itself. Caller wires `wss://` upstreams via the standard URL.
-    let scheme = if upstream_url.scheme() == "https" {
-        "wss"
+    let bad_gateway = WsUpgradeDecision::Reject {
+        status: 502,
+        headers: Vec::new(),
+    };
+    let upstream_url = route.upstream_url();
+
+    let (upstream, resp) = if let Some(sock) = unix_upstream_path(upstream_url) {
+        // Private routes may hand off over a Unix socket; the WS
+        // handshake then runs over the UnixStream instead of a fresh
+        // TCP dial.
+        let ws_url = format!("ws://localhost{path_str}");
+        let Some(upstream_req) = build_upstream_request(&ws_url, upstream_headers) else {
+            return bad_gateway;
+        };
+        let stream = match tokio::net::UnixStream::connect(sock).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, upstream = %sock, "ws: unix upstream dial failed");
+                return bad_gateway;
+            }
+        };
+        match tokio_tungstenite::client_async(upstream_req, stream).await {
+            Ok((ws, resp)) => {
+                info!(app = %route.name, upstream = %sock, "ws: bridging to unix upstream");
+                (UpstreamWs::Unix(ws), resp)
+            }
+            Err(e) => {
+                warn!(error = %e, upstream = %sock, "ws: unix upstream handshake failed");
+                return bad_gateway;
+            }
+        }
     } else {
-        "ws"
-    };
-    let ws_url = format!("{scheme}://{host}:{port}{path_str}");
-
-    info!(
-        app = %route.name,
-        upstream = %ws_url,
-        upstream_header_count = upstream_headers.len(),
-        "ws: dialing upstream"
-    );
-
-    let Some(upstream_req) = build_upstream_request(&ws_url, &upstream_headers, &conn).await else {
-        return;
-    };
-
-    let (upstream_ws, _resp) = match tokio_tungstenite::connect_async(upstream_req).await {
-        Ok(ok) => ok,
-        Err(e) => {
-            warn!(error = %e, upstream = %ws_url, "ws: upstream dial failed");
-            let _ = conn
-                .close(
-                    WS_CLOSE_BAD_GATEWAY,
-                    Bytes::from_static(b"upstream dial failed"),
-                )
-                .await;
-            return;
+        let Some(host) = upstream_url.host_str() else {
+            warn!(route = %route.name, "ws: route upstream has no host");
+            return bad_gateway;
+        };
+        let port =
+            upstream_url
+                .port_or_known_default()
+                .unwrap_or(if upstream_url.scheme() == "https" {
+                    443
+                } else {
+                    80
+                });
+        // Plain `ws://`; the local CA only fronts the SNI listener path,
+        // and the upstream is always a loopback app speaking ws/wss
+        // itself. Caller wires `wss://` upstreams via the standard URL.
+        let scheme = if upstream_url.scheme() == "https" {
+            "wss"
+        } else {
+            "ws"
+        };
+        let ws_url = format!("{scheme}://{host}:{port}{path_str}");
+        info!(
+            app = %route.name,
+            upstream = %ws_url,
+            upstream_header_count = upstream_headers.len(),
+            "ws: dialing upstream"
+        );
+        let Some(upstream_req) = build_upstream_request(&ws_url, upstream_headers) else {
+            return bad_gateway;
+        };
+        match tokio_tungstenite::connect_async(upstream_req).await {
+            Ok((ws, resp)) => (UpstreamWs::Tcp(ws), resp),
+            Err(e) => {
+                warn!(error = %e, upstream = %ws_url, "ws: upstream dial failed");
+                return bad_gateway;
+            }
         }
     };
 
-    bridge_session(upstream_ws, conn).await;
+    // tungstenite has already checked the upstream picked one of the
+    // offered subprotocols (or none when none were offered).
+    let headers = resp
+        .headers()
+        .get(tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .map(|v| {
+            vec![(
+                Bytes::from_static(b"sec-websocket-protocol"),
+                Bytes::copy_from_slice(v.as_bytes()),
+            )]
+        })
+        .unwrap_or_default();
+    WsUpgradeDecision::Accept {
+        headers,
+        state: Some(WsHandlerState::new(upstream)),
+    }
 }
 
 /// Build the upgrade Request via `IntoClientRequest` (which fills
@@ -374,11 +352,10 @@ async fn run_session(
 /// names/values is intentional — the middleware produces
 /// well-formed headers, but the wire payload is untrusted bytes
 /// and we'd rather drop a bad header than refuse the upgrade.
-/// `None` ⇒ the visitor connection was already closed with an error.
-async fn build_upstream_request(
+/// `None` ⇒ the URL didn't make a request.
+fn build_upstream_request(
     ws_url: &str,
     upstream_headers: &[(Bytes, Bytes)],
-    conn: &WsConnection,
 ) -> Option<tokio_tungstenite::tungstenite::handshake::client::Request> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
@@ -386,12 +363,6 @@ async fn build_upstream_request(
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, upstream = %ws_url, "ws: building upstream request failed");
-            let _ = conn
-                .close(
-                    WS_CLOSE_INTERNAL_ERROR,
-                    Bytes::from_static(b"upstream req build failed"),
-                )
-                .await;
             return None;
         }
     };
@@ -402,7 +373,23 @@ async fn build_upstream_request(
                 warn!(name = %String::from_utf8_lossy(name), "ws: skipping malformed header name on upstream dial");
                 continue;
             };
-            let Ok(hv) = HeaderValue::from_bytes(value) else {
+            // tungstenite 0.24 splits the offer on ',' without trimming,
+            // so the browser form `a, b` would fail its check of the
+            // upstream's pick; send `a,b`.
+            let value =
+                if hn == tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL {
+                    Bytes::from(
+                        String::from_utf8_lossy(value)
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                } else {
+                    value.clone()
+                };
+            let Ok(hv) = HeaderValue::from_bytes(&value) else {
                 warn!(name = %String::from_utf8_lossy(name), "ws: skipping malformed header value on upstream dial");
                 continue;
             };
@@ -614,7 +601,11 @@ fn take_header<'a>(headers: &'a [(Bytes, Bytes)], wanted: &[u8]) -> Option<&'a [
 ///     `is_hop_by_hop` exclusions, and
 ///   - the WS-handshake mechanics `tokio_tungstenite`'s
 ///     `IntoClientRequest` regenerates for the upstream (`Host`,
-///     `Upgrade`, `Sec-WebSocket-*`, `Content-Length`).
+///     `Upgrade`, `Sec-WebSocket-Key/Version/Extensions`,
+///     `Content-Length`).
+///
+/// `Sec-WebSocket-Protocol` is forwarded: the upstream picks from the
+/// client's offer, and its pick goes back on the WS_ACCEPT.
 ///
 /// Forwarding these would clobber the dialer's correct values — most
 /// importantly `Host`, which the visitor sends as the p2claw alias but
@@ -640,7 +631,6 @@ fn is_ws_hop_or_handshake_header(name: &[u8]) -> bool {
         b"sec-websocket-key",
         b"sec-websocket-version",
         b"sec-websocket-extensions",
-        b"sec-websocket-protocol",
         b"content-length",
     ];
     EXCLUDED.iter().any(|h| name.eq_ignore_ascii_case(h))

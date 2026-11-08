@@ -81,6 +81,9 @@ pub struct WsConnection {
     /// can return the code/reason after `recv` returns `None`.
     pub(crate) peer_close_code: AtomicU16,
     pub(crate) peer_close_reason: Mutex<Bytes>,
+    /// Headers that came on the peer's WS_ACCEPT (client side only;
+    /// empty on the server side).
+    pub(crate) accept_headers: Vec<(Bytes, Bytes)>,
 }
 
 #[derive(Debug)]
@@ -99,6 +102,12 @@ impl std::fmt::Debug for WsConnection {
 }
 
 impl WsConnection {
+    /// Headers the peer sent with its WS_ACCEPT, such as the selected
+    /// `Sec-WebSocket-Protocol`. Empty on the accepting side.
+    pub fn accept_headers(&self) -> &[(Bytes, Bytes)] {
+        &self.accept_headers
+    }
+
     /// Send a WebSocket frame. Returns `ConnectionClosed` if the
     /// underlying connection has gone away or the local side has
     /// already sent WS_CLOSE.

@@ -701,3 +701,149 @@ async fn ws_visitor_sees_bad_gateway_when_upstream_dies_mid_stream() {
     let _ = tokio::time::timeout(Duration::from_secs(5), serve_handle).await;
     std::mem::forget(dir);
 }
+
+/// Echo upstream that speaks only `rex.control.v1`: it selects that
+/// subprotocol when offered and refuses the upgrade otherwise.
+#[allow(clippy::result_large_err)]
+async fn start_subprotocol_upstream() -> u16 {
+    use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let cb = |req: &Request, mut resp: Response| -> Result<Response, ErrorResponse> {
+                    let offered = req
+                        .headers()
+                        .get("sec-websocket-protocol")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    if !offered.split(',').any(|p| p.trim() == "rex.control.v1") {
+                        let mut err = ErrorResponse::new(Some("want rex.control.v1".into()));
+                        *err.status_mut() =
+                            tokio_tungstenite::tungstenite::http::StatusCode::BAD_REQUEST;
+                        return Err(err);
+                    }
+                    resp.headers_mut()
+                        .insert("sec-websocket-protocol", "rex.control.v1".parse().unwrap());
+                    Ok(resp)
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(stream, cb).await else {
+                    return;
+                };
+                while let Some(Ok(msg)) = ws.next().await {
+                    if msg.is_text() && ws.send(msg).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Spin up a WsForwarder over an in-process translator wire with one
+/// public route to `upstream`, and return the client end.
+async fn wsforwarder_client(upstream: String) -> (ClientConnection, tempfile::TempDir) {
+    let dir = tempdir().unwrap();
+    let routes = RouteTable::load_or_empty(dir.path().join("routes.json"));
+    routes
+        .upsert(RouteRecord {
+            name: APP.into(),
+            upstream,
+            registered_at: 0,
+            auth: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("upsert ws route");
+    let forwarder = Forwarder::new(routes, PARENT_DOMAIN.into());
+    let ws_handler: Arc<dyn WsHandler> = Arc::new(WsForwarder::new(forwarder.clone()));
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let opts = p2claw_translator::ServeOptions {
+            ws_handler: Some(ws_handler),
+            ..Default::default()
+        };
+        let _ = p2claw_translator::serve_with(server_io, forwarder, opts).await;
+    });
+    (ClientConnection::spawn(client_io), dir)
+}
+
+fn upgrade_offering(protocols: Option<&'static str>) -> ClientWsUpgrade {
+    let mut upgrade = ClientWsUpgrade::new(Bytes::from_static(b"/control")).header(
+        Bytes::from_static(b"host"),
+        Bytes::from(format!("{APP}-{ALIAS}.{PARENT_DOMAIN}")),
+    );
+    if let Some(p) = protocols {
+        upgrade = upgrade.header(
+            Bytes::from_static(b"sec-websocket-protocol"),
+            Bytes::from_static(p.as_bytes()),
+        );
+    }
+    upgrade
+}
+
+/// The client's subprotocol offer reaches the upstream, and the
+/// upstream's pick comes back on the WS_ACCEPT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_upgrade_negotiates_the_upstreams_subprotocol() {
+    let port = start_subprotocol_upstream().await;
+    let (client, _dir) = wsforwarder_client(format!("http://127.0.0.1:{port}")).await;
+
+    let ws = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.open_websocket(upgrade_offering(Some("other.v0, rex.control.v1"))),
+    )
+    .await
+    .expect("open_websocket within 10s")
+    .expect("open_websocket ok");
+
+    let selected: Vec<_> = ws
+        .accept_headers()
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case(b"sec-websocket-protocol"))
+        .map(|(_, v)| v.clone())
+        .collect();
+    assert_eq!(selected, vec![Bytes::from_static(b"rex.control.v1")]);
+
+    ws.send(WsMessage::text(Bytes::from_static(b"ping")))
+        .await
+        .expect("send");
+    let echoed = tokio::time::timeout(Duration::from_secs(5), ws.recv())
+        .await
+        .expect("recv within 5s")
+        .expect("recv ok")
+        .expect("frame present");
+    assert_eq!(echoed.payload, Bytes::from_static(b"ping"));
+}
+
+/// An upstream that refuses the handshake, or isn't there, is a clean
+/// 502 rejection rather than an accept followed by a close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ws_upgrade_rejects_with_502_when_the_upstream_refuses() {
+    let port = start_subprotocol_upstream().await;
+    let (client, _dir) = wsforwarder_client(format!("http://127.0.0.1:{port}")).await;
+    let err = client
+        .open_websocket(upgrade_offering(None))
+        .await
+        .expect_err("upstream refuses without rex.control.v1");
+    assert!(
+        matches!(err, p2claw_translator::TranslatorError::Cancelled(code) if code.0 == 502),
+        "got {err:?}"
+    );
+
+    // Nothing listening.
+    let dead = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let (client, _dir) = wsforwarder_client(format!("http://127.0.0.1:{dead_port}")).await;
+    let err = client
+        .open_websocket(upgrade_offering(None))
+        .await
+        .expect_err("no upstream");
+    assert!(
+        matches!(err, p2claw_translator::TranslatorError::Cancelled(code) if code.0 == 502),
+        "got {err:?}"
+    );
+}

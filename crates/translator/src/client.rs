@@ -204,7 +204,8 @@ impl ClientConnection {
         self.check_goaway(stream_id).await?;
         debug!(?stream_id, ?req.path, "client: issuing request");
 
-        let (response_tx, response_rx) = oneshot::channel();
+        let (response_tx, response_rx) =
+            oneshot::channel::<Result<ClientResponse, TranslatorError>>();
         let (body_tx, trailers_tx, error_tx, body_rx) = IncomingBody::channel(32);
 
         {
@@ -317,7 +318,8 @@ impl ClientConnection {
         let stream_id = self.next_stream_id();
         self.check_goaway(stream_id).await?;
 
-        let (accept_tx, accept_rx) = oneshot::channel::<Result<(), TranslatorError>>();
+        let (accept_tx, accept_rx) =
+            oneshot::channel::<Result<Vec<(Bytes, Bytes)>, TranslatorError>>();
         let (events_tx, events_rx) = mpsc::channel::<WsInboundEvent>(32);
 
         // Reuse the existing StreamState by routing the accept-signal
@@ -364,7 +366,7 @@ impl ClientConnection {
         };
 
         match accept_rx.await {
-            Ok(Ok(())) => {
+            Ok(Ok(accept_headers)) => {
                 let mut cancel_guard = cancel_guard;
                 cancel_guard.armed = false;
                 Ok(WsConnection {
@@ -374,6 +376,7 @@ impl ClientConnection {
                     closed_local: AtomicBool::new(false),
                     peer_close_code: std::sync::atomic::AtomicU16::new(0),
                     peer_close_reason: tokio::sync::Mutex::new(Bytes::new()),
+                    accept_headers,
                 })
             }
             Ok(Err(e)) => Err(e),
@@ -429,19 +432,19 @@ impl ClientConnection {
 }
 
 /// Convert the WS-upgrade accept-signal oneshot to the existing
-/// `response_tx` shape. We synthesize a tiny `ClientResponse` for
-/// "accepted" so the reader's RES/Err handling path can be reused
-/// — the caller never observes the synthesized value.
+/// `response_tx` shape. The reader synthesizes a tiny 101
+/// `ClientResponse` for WS_ACCEPT so its RES/Err handling path can be
+/// reused; only the WS_ACCEPT headers it carries reach the caller.
 fn map_accept_to_response_tx(
-    accept_tx: oneshot::Sender<Result<(), TranslatorError>>,
+    accept_tx: oneshot::Sender<Result<Vec<(Bytes, Bytes)>, TranslatorError>>,
 ) -> oneshot::Sender<Result<ClientResponse, TranslatorError>> {
     // Adapter: spawn a task that converts the response-tx output into
     // the accept-tx semantics.
-    let (response_tx, response_rx) = oneshot::channel();
+    let (response_tx, response_rx) = oneshot::channel::<Result<ClientResponse, TranslatorError>>();
     tokio::spawn(async move {
         match response_rx.await {
-            Ok(Ok(_resp)) => {
-                let _ = accept_tx.send(Ok(()));
+            Ok(Ok(resp)) => {
+                let _ = accept_tx.send(Ok(resp.headers));
             }
             Ok(Err(e)) => {
                 let _ = accept_tx.send(Err(e));
@@ -647,7 +650,7 @@ async fn reader_task<St>(
                     }
                 }
             }
-            Frame::WsAccept { stream_id, .. } => {
+            Frame::WsAccept { stream_id, headers } => {
                 let mut pending = shared.pending.lock().await;
                 let Some(state) = pending.get_mut(&stream_id) else {
                     warn!(?stream_id, "WS_ACCEPT for unknown stream");
@@ -656,7 +659,7 @@ async fn reader_task<St>(
                 if let Some(response_tx) = state.response_tx.take() {
                     let resp = ClientResponse {
                         status: 101,
-                        headers: Vec::new(),
+                        headers,
                         body: IncomingBody::empty(),
                     };
                     let _ = response_tx.send(Ok(resp));

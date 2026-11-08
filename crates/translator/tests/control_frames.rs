@@ -10,7 +10,7 @@ use bytes::Bytes;
 use p2claw_translator::{
     serve, serve_with, ws::WsMessage, ClientConnection, ClientOptions, ClientRequest,
     ClientWsUpgrade, Handler, OutgoingBody, ServeOptions, ServerRequest, ServerResponse,
-    ServerWsUpgrade, WsConnection, WsHandler, WsUpgradeDecision,
+    ServerWsUpgrade, WsConnection, WsHandler, WsHandlerState, WsUpgradeDecision,
 };
 use p2claw_wire::ErrorCode;
 use tokio::io::duplex;
@@ -143,7 +143,7 @@ async fn websocket_round_trip_echo() {
             Box::pin(async move {
                 WsUpgradeDecision::Accept {
                     headers: Vec::new(),
-                    upstream_headers: Vec::new(),
+                    state: None,
                 }
             })
         }
@@ -151,7 +151,7 @@ async fn websocket_round_trip_echo() {
         fn run(
             &self,
             _upgrade: ServerWsUpgrade,
-            _upstream_headers: Vec<(Bytes, Bytes)>,
+            _state: Option<WsHandlerState>,
             conn: WsConnection,
         ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
             Box::pin(async move {
@@ -215,7 +215,7 @@ async fn websocket_upgrade_rejection_returns_cancelled() {
         fn run(
             &self,
             _upgrade: ServerWsUpgrade,
-            _upstream_headers: Vec<(Bytes, Bytes)>,
+            _state: Option<WsHandlerState>,
             _conn: WsConnection,
         ) -> Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
             Box::pin(async move {})
