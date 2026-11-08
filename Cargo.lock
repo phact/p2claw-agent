@@ -3029,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "p2claw-agent"
-version = "0.10.23"
+version = "0.11.0"
 dependencies = [
  "axum",
  "base64",
